@@ -12,6 +12,12 @@ const HUGE: usize = 2 << 20;
 /// Target size of one block; the real size is a whole number of staging lines.
 const BLOCK: usize = 32 << 10;
 
+/// On unless SS_NO_REUSE: blocks a stage has finished reading are pooled, and new blocks are taken from
+/// the pool before fresh memory (whose first touch makes the kernel zero it).
+pub static REUSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Pooled blocks, all exactly `BLOCK` bytes and 64-byte aligned.
+static POOL: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
 /// Hands out 64-byte-aligned memory from large regions. Nothing is ever returned.
 struct Arena {
     next: *mut u8,
@@ -154,7 +160,11 @@ impl<T: Copy> Scatter<T> {
 
     #[cold]
     fn new_block(&mut self, part: usize) -> *mut u8 {
-        let block = self.arena.alloc(Self::BLOCK);
+        let pooled = if REUSE.load(std::sync::atomic::Ordering::Relaxed) { POOL.lock().unwrap().pop() } else { None };
+        let block = match pooled {
+            Some(b) => b as *mut u8,
+            None => self.arena.alloc(Self::BLOCK),
+        };
         self.blocks[part].push(block);
         self.at[part] = unsafe { block.add(Self::LINE) };
         self.end[part] = unsafe { block.add(Self::BLOCK) };
@@ -200,6 +210,14 @@ unsafe impl<T: Send> Send for Scattered<T> {}
 unsafe impl<T: Sync> Sync for Scattered<T> {}
 
 impl<T: Copy> Scattered<T> {
+    /// Hands this partition's blocks to the pool: the caller will not read them
+    /// again. Only whole `BLOCK`-byte blocks are pooled.
+    pub fn recycle(&self, part: usize) {
+        if REUSE.load(std::sync::atomic::Ordering::Relaxed) && self.per_block * std::mem::size_of::<T>() == BLOCK {
+            POOL.lock().unwrap().extend(self.blocks[part].iter().map(|&b| b as usize));
+        }
+    }
+
     pub fn len(&self, part: usize) -> usize {
         self.counts[part]
     }

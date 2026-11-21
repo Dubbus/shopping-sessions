@@ -588,6 +588,7 @@ fn main() -> Res<()> {
     let (ablate, skip) = (knob("SS_ABLATE").unwrap_or(0), knob("SS_SKIP").unwrap_or(0));
     scan::PORTABLE.store(knob("SS_NO512").is_some(), Ordering::Relaxed);
     scatter::PLAIN_STORES.store(knob("SS_PLAIN_STORES").is_some(), Ordering::Relaxed);
+    scatter::REUSE.store(knob("SS_NO_REUSE").is_none(), Ordering::Relaxed);
     let ctx = Ctx { ablate, skip, window_start, window_end, base, products, unknown_category, campaigns, renames: OnceLock::new(), event_bits, person_bits };
     let parsed = par::run(
         threads,
@@ -814,6 +815,10 @@ fn main() -> Res<()> {
             }
             state.kept = winners;
             state.settle_all(renames, person_bits);
+            // This partition's events are never read again.
+            for thread in &events {
+                thread.recycle(part);
+            }
         },
     )
     .into_iter()

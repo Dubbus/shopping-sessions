@@ -188,3 +188,29 @@ Known gaps going into phase 3:
   size); only the 20M one has.
 - Lesson from `apt`: never wrap `docker` with a script on PATH that calls `sudo docker`; on
   NixOS `sudo` keeps PATH, so the wrapper calls itself without end.
+
+## Road to 0.65 s (2026-11-21, night)
+
+**Calibration.** The scorer reads about 0.7x our GCP n2-standard-8 container time (this branch:
+1.50 s container -> 1.09 s on the board; master: 2.96 s -> 2.05 s). Beating 0.65 s on the board
+means about **0.85 s container / 0.65 s native** at 20M events on `ss-bench`. Today: 1.44 s
+container, 1.28 s native. A 40-45% cut, every stage.
+
+**Where the time goes now** (`ss-bench`, native, 8 threads pinned, 20M events):
+
+| Stage | Now | Budget | How |
+|---|---|---|---|
+| open | 11 ms | 10 | - |
+| parse | 730 ms | 330 | profile-driven: tokenizer + field conversion per line, read copy, faults |
+| dedup | 266 ms | 120 | fewer passes over records; tables sized to L2; no per-record branches |
+| sessions | 236 ms | 120 | grouping without hash tables; cheaper per-person sort; clicks |
+| write | 39 ms | 30 | int32 count columns (smaller files flush faster) |
+| exit + docker flush | ~160 ms | ~120 | smaller output; check teardown cost |
+
+**Method.** One change at a time. Each one: `scripts/verify.sh` (fixtures, adversarial, dev
+answer, 20M output identical to master's), then `scripts/ab.sh` on `ss-bench` alternating
+base and new builds; kept only on a measured gain. A practice submission whenever the rig
+shows a real step (>= 5%), so the board tracks the rig.
+
+**Profile at the start** (perf, 8 threads): parse loop 33%, dedup 19%, sessions 12%,
+timestamps 9%, kernel page zeroing 6%, read copy 4%, per-person sort 3%.

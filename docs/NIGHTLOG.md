@@ -11,7 +11,7 @@ Container on ss-bench (Cascade Lake, scorer flags, 20M): 1.33-1.35 s median. 60M
 ## Experiment queue (top first; strike through when done)
 
 1. ~~Dedup bitmap size: `count * 8` bits now; try 4 and 16 (knob) - fewer L1 misses vs more candidates.~~ No win (see log).
-2. Thread count: NCPU 7 / 8 / 9 / 10 on ss-bench (oversubscription can hide stalls).
+2. ~~Thread count: NCPU 7 / 8 / 9 / 10 on ss-bench (oversubscription can hide stalls).~~ 8 is best.
 3. Block reuse: survivors' scatter takes blocks freed by dedup (already faulted pages) instead of
    new huge pages - kernel page zeroing is ~5.7% of samples.
 4. Chunk size with mmap reads: SS_CHUNK_KB 256 / 512 / 1024 / 2048 (fault-around and scheduling).
@@ -23,3 +23,8 @@ Container on ss-bench (Cascade Lake, scorer flags, 20M): 1.33-1.35 s median. 60M
 - 03:50 container (ss-bench, 5 runs): median 1.319 s (min 1.307).
 - 04:05 queue 1, dedup bitmap bits per event (4 rounds, total ms): 8 -> 1120/1122/1119/1126; 4 -> 1138/1129/1130/1135 (worse); 16 -> 1129/1120/1127/1129 (dedup -1 ms, total no better). Kept 8; code reverted.
 - 04:06 sweep 1 (seeds 100-139, 300k events, pipeline vs both references): 40/40 agree. Started seeds 200-239 on the current head (~/sweep2.log).
+- 04:41 merge: no new clean-slate commits.
+- 04:44 verify: 169/172 (3 known), dev MATCH, 20m MATCH.
+- 04:50 container (5 runs): median 1.340 s (min 1.337); rig drift vs 03:50 (1.319).
+- 05:00 queue 2, threads (4 rounds, total ms): NCPU=8 1134-1138; 7 1181-1190; 9 1137-1152; 10 1144-1170; 12 1158-1192. 8 stays.
+- 05:00 sweep 2 (seeds 200-239, 300k, vs both references): 40/40 agree. 80/80 seeds overall tonight.

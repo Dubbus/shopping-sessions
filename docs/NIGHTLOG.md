@@ -15,7 +15,7 @@ Container on ss-bench (Cascade Lake, scorer flags, 20M): 1.33-1.35 s median. 60M
 3. ~~Block reuse: survivors' scatter takes blocks freed by dedup (already faulted pages) instead of
    new huge pages - kernel page zeroing is ~5.7% of samples.~~ Kept (85dd944).
 4. ~~Chunk size with mmap reads: SS_CHUNK_KB 256 / 512 / 1024 / 2048 (fault-around and scheduling).~~ 512 stays.
-5. Event partition count (event_bits) +-1 and person partition count +-1 with mmap reads in place.
+5. ~~Event partition count (event_bits) +-1 and person partition count +-1 with mmap reads in place.~~ Event: one bit fewer kept (2f45fb1); person: no win.
 
 ## Log
 - 03:41 merge: no new clean-slate commits.
@@ -39,3 +39,7 @@ Container on ss-bench (Cascade Lake, scorer flags, 20M): 1.33-1.35 s median. 60M
 - 06:50 container (5 runs): median 1.352 s (min 1.347).
 - 07:05 queue 4, chunk size with mapped reads (4 rounds, total ms): 512 1135-1145; 256 1132-1140 (parse identical, within noise); 1024 1140-1153; 2048 1165-1171. 512 stays.
 - 07:06 sweep 3 started on 85dd944 (block reuse): seeds 300-339, ~/sweep3.log.
+- 07:41 merge: no new clean-slate commits.
+- 07:44 verify on 85dd944: 169/172 (3 known), dev MATCH, 20m MATCH. Container (5 runs): median 1.383 s (rig drifting up through the night: 1.319 -> 1.383 on near-identical code).
+- 08:00 queue 5, partitions (4 rounds, 20M, total ms): default (event 10 bits) 1145-1152 (+1 outlier); event 9: 1134-1149, every round better (parse -12 ms); event 11: 1158-1296; person 8: 1156-1180; person 10: 1155-1170. 60M: event 12 (default) 3.67-3.94 s vs 11: 3.53-3.62 s.
+- 08:05 kept: event partitions sized for 64k events (rule, so it scales: 9 bits at 20M, 11 at 60M). Verified, committed 2f45fb1, pushed.

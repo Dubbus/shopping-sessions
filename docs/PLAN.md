@@ -1,6 +1,9 @@
 # Shopping Sessions: plan to win
 
-Status: phases 0–2 done (2026-11-21). See [Progress](#progress) at the end.
+Status (2026-11-21, 07:10 UTC): two practice submissions scored, **1.09 s** then **0.89 s**; the
+leader is at 0.65 s. The branch head is predicted at about 0.87 s. See
+[Where we are](#where-we-are) for the current design and numbers; the sections before it are
+the original plan.
 
 ## Goal
 
@@ -165,29 +168,98 @@ data/, out/      generated datasets and outputs (ignored)
 | Tuning for our machines instead of the scorer's | GCP n2 for final tuning; practice submissions as ground truth |
 | A late optimisation breaks correctness | Full sweep gates every merge; freeze before the final |
 
-## Progress
+## Where we are
 
-**2026-11-21: phases 0–2.**
+### Results
 
-- Version 1 (`pipeline/`, about 900 lines of Rust with dependencies) passes all 36 fixtures and
-  the dev answer, natively and through the Docker image with the scorer's container flags.
-- Both references pass the 36 fixtures and the dev answer. Pipeline and both references agree on
-  24 seeds at 300k events; pipeline and reference A agree on one 20M-event set.
-- Native timings on an Apple-silicon Mac with 8 threads, warm files: 1M events 0.18 s,
-  20M about 3.1 s, 60M about 6.2 s (peak memory 10.9 GB, mapped input included). Parsing is
-  about 80% of the time.
-- The image is under 4 MB (static binary, empty base).
+Whole container on `ss-bench` (GCP n2-standard-8, Cascade Lake, scorer's `docker run` flags,
+input already in the page cache), 20M events unless noted:
 
-Known gaps going into phase 3:
+| Commit | What changed | `ss-bench` | Leaderboard |
+|---|---|---|---|
+| version 1 | shared ID table, mapped input, Parquet library | 3.0 s | - |
+| `478f4eb` | partitioned stages, AVX-512 tokenizer, 8-byte IDs, dictionary Parquet | 1.36 s | **1.09 s** |
+| `c16006c` | hand-written Parquet writer | 1.29 s | - |
+| `1f99d0e` | profile-guided image build | 1.23 s | - |
+| `1609b8d` | word-at-a-time timestamps, campaign array, bucketed link numbering | about 1.16 s | **0.89 s** |
+| `f3f9aaf` | two-pass dedup, constant-layout partition writer, integer sorts | 1.12 s | about 0.87 s (predicted) |
 
-- No timing yet on x86-64, and none on anything like the scorer.
-- The amd64 build targets AVX2 only (`x86-64-v3`); AVX-512 is not used yet.
-- Parse scales poorly across threads (about 3.4 cores busy of 8 on the dev set). Suspects: the
-  shared user-ID interner's locks and page faults from growing per-thread buffers.
-- The 60M run has not been checked against a reference (the references are too slow at that
-  size); only the 20M one has.
-- Lesson from `apt`: never wrap `docker` with a script on PATH that calls `sudo docker`; on
-  NixOS `sudo` keeps PATH, so the wrapper calls itself without end.
+At 60M events `f3f9aaf` takes about 3.2 s on `ss-bench` with a peak of about 7 GB.
+`master` (Adarsh's implementation) takes 1.99 s on the same machine and scored 1.94 s.
+
+**Predicting the board.** Our two scored commits came in at 0.80 and about 0.77 of their
+`ss-bench` time, so the prediction is `ss-bench` time x 0.78. `master`'s ratio is 0.97, so the
+ratio depends on the code; it is a guide, not a law.
+
+### The pipeline today
+
+Every stage is parallel over partitions small enough to stay in cache; records move from one
+stage to the next by being scattered on the hash of what the next stage looks up.
+
+1. **Parse.** Files are read in 512 KB chunks into a reusable buffer (`io.rs`). One AVX-512
+   pass records comma and newline positions and quote counts; lines are cut into fields from
+   those with no per-byte work (`scan.rs`). IDs of up to 9 ASCII bytes pack exactly into a
+   `u64`, others are interned (`key.rs`). One thread turns `links/` into the ID -> person-name
+   table (`link.rs`) while the rest parse `events/`, scattered by `event_id`; `clicks/` are
+   parsed last, get their person at once, and are scattered by person.
+2. **Dedup.** Per `event_id` partition: two small bitmaps find the IDs that occur more than
+   once, only those go through an exact table, and every survivor gets its person (rename
+   table slot prefetched 16 ahead) and is scattered by person.
+3. **Sessions.** Per person partition: people are numbered, their events and clicks grouped
+   with a counting pass and sorted as plain integers, then one sweep per person builds
+   sessions, credits clicks, counts assists and fills the daily rows.
+4. **Write.** Our own Parquet writer (`output.rs`): every column dictionary-encoded, one file
+   per thread for `user_daily`.
+
+The partition writer (`scatter.rs`) stages records in a cache-resident line per partition and
+flushes with non-temporal stores into huge-page blocks.
+
+Dependencies left: `hashbrown` (three small tables), `memchr`, `xxhash-rust` (product lookup),
+`mimalloc`, `libc` (one `madvise` call).
+
+### What the measurements taught us
+
+- **Docker returns only after the output is flushed to disk**, so output size is part of the
+  score: plain Parquet cost 0.3 s at 20M and 1 s at 60M. Output is now 20 MB / 61 MB.
+- **The exit itself is free** natively (15 ms); nothing is gained by freeing memory.
+- **Hyperthreads add little**: 4 threads on 4 cores take 1.28 s where all 8 take 1.10 s.
+- **Partition counts and chunk size barely matter** between 32 KB and 512 KB chunks and across
+  a 16x range of partition counts; the cost is CPU work per record.
+- **The rename lookup is the dearest step of dedup** (about half of it) even with prefetching;
+  the survivor scatter is another quarter.
+- **Sorting was 45% of the sessions stage** until events and clicks became integers.
+- **`ss-bench` drifts by up to 10% over an hour.** Only alternating A/B runs (`scripts/ab.sh`)
+  are trustworthy for changes under 5%.
+
+### Correctness status
+
+- 36/36 official fixtures and the published dev answer, natively and through the image.
+- 180/183 adversarial cases (`tests/adversarial`, `scripts/make_adversarial.py`). The three
+  failures are windows longer than 42 days, which this build refuses: timestamps are stored as
+  `u32` milliseconds from `window_start - 7 days`. The generator always uses 14 days.
+- Both Python references and the pipeline agree on 88 seeds at 300k events (the last 40 on
+  `478f4eb`); reference A agrees at 20M.
+- Output identical to `master`'s at 20M and 60M (seed 9), and at 60M for seeds 21 to 23 run
+  through the image under the scorer's limits.
+- Where the references disagree (`tests/adversarial-disputed`): hidden `.csv` files are not
+  read; an `ingest_ts` that is not valid F1 drops its line (the rules say it cannot happen).
+
+### Not done from the original plan
+
+- Seed sweeps have not been rerun since `478f4eb`; everything since is checked against the
+  fixtures, adversarial cases, dev answer and `master`'s output only.
+- No written memory budget; measured peak is 7 GB of 24 GB at 60M.
+- No cluster-wide sweep runner. The homelab is unused since a `sudo docker` wrapper script
+  called itself without end on `apt` (NixOS `sudo` keeps PATH) and took the machine down.
+- Windows over 42 days.
+
+### Next, in order of expected gain
+
+1. Rename lookup: a small fingerprint array in front of the table, so the two thirds of
+   lookups that miss never leave the cache.
+2. Sessions sweep: assists counted in their own compact array; cheaper person numbering.
+3. Tokenizer: fewer port-5 operations per block (masks only, positions on demand).
+4. Rerun the seed sweep on the head, and on every submitted commit from now on.
 
 ## Road to 0.65 s (2026-11-21, night)
 

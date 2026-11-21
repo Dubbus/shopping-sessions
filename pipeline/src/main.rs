@@ -33,7 +33,7 @@ use std::time::Instant;
 use hashbrown::HashTable;
 use key::{Id, partition, remix};
 use scatter::{Scatter, Scattered};
-use table::{Str, StrMap};
+use table::{Campaigns, Str, StrMap};
 use ts::DAY_MS;
 
 #[global_allocator]
@@ -106,7 +106,7 @@ struct Ctx {
     base: i64,
     products: StrMap,
     unknown_category: u32,
-    campaigns: StrMap,
+    campaigns: Campaigns,
     /// Set by the link task; the click parsers wait for it.
     renames: OnceLock<link::Renames>,
     event_bits: u32,
@@ -198,14 +198,19 @@ fn parse_event(&[id, user, ts, ingest, kind, product, price]: &[&[u8]; 7], ctx: 
         if t < ctx.window_start || t >= ctx.window_end || ingest * 1000 - t > DAY_MS {
             break 'valid;
         }
-        let cents = match kind {
-            b"view" | b"cart" => 0,
-            b"purchase" => {
-                let Some(cents) = parse_price(price) else { break 'valid };
-                event.category = ctx.products.get(product).unwrap_or(ctx.unknown_category);
-                cents
+        // The event type, compared as an integer: `view`, `cart` or `purchase`, exactly.
+        let cents = if kind.len() == 4 {
+            let word = u32::from_le_bytes(kind.try_into().unwrap());
+            if word != u32::from_le_bytes(*b"view") && word != u32::from_le_bytes(*b"cart") {
+                break 'valid;
             }
-            _ => break 'valid,
+            0
+        } else if kind.len() == 8 && u64::from_le_bytes(kind.try_into().unwrap()) == u64::from_le_bytes(*b"purchase") {
+            let Some(cents) = parse_price(price) else { break 'valid };
+            event.category = ctx.products.get(product).unwrap_or(ctx.unknown_category);
+            cents
+        } else {
+            break 'valid;
         };
         event.ts = (t - ctx.base) as u32;
         event.user = unsafe { key::id(user) };
@@ -472,7 +477,7 @@ fn main() -> Res<()> {
     }
     let unknown_category = category_id(b"unknown");
 
-    let mut campaigns = StrMap::default();
+    let mut campaigns = Campaigns::default();
     let mut campaign_names: Vec<Str> = Vec::new();
     let mut channels: Vec<Str> = Vec::new();
     for (campaign, channel) in pairs(read_static(&data_dir.join("campaigns.csv"))?) {

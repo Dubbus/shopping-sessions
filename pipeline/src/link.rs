@@ -87,48 +87,52 @@ pub fn resolve(links: &[(Id, Id)]) -> Renames {
     if links.is_empty() {
         return Renames::new(&[]);
     }
-    // Number every ID that appears in a link. The table is far bigger than the cache, so
-    // each batch of lookups is prefetched before it is made.
-    let capacity = (links.len() * 4).next_power_of_two().max(16);
-    let shift = 64 - capacity.trailing_zeros();
-    let mut numbered: Vec<(Id, u32)> = vec![(0, 0); capacity];
-    let mut ids: Vec<Id> = Vec::new();
-    let mut edges: Vec<[u32; 2]> = Vec::with_capacity(links.len());
-    for batch in links.chunks(32) {
-        for &(a, b) in batch {
-            prefetch(numbered.as_ptr().wrapping_add(home(key::hash(a), shift)));
-            prefetch(numbered.as_ptr().wrapping_add(home(key::hash(b), shift)));
-        }
-        for &(a, b) in batch {
-            let mut number = |id: Id| -> u32 {
-                let mut at = home(key::hash(id), shift);
-                loop {
-                    let slot = &mut numbered[at];
-                    if slot.0 == id {
-                        return slot.1;
-                    }
-                    if slot.0 == 0 {
-                        *slot = (id, ids.len() as u32);
-                        ids.push(id);
-                        return slot.1;
-                    }
-                    at = (at + 1) & (capacity - 1);
+    // Number every ID that appears in a link. One big table would miss the cache on every
+    // lookup, so the endpoints are first dealt into buckets by the top bits of their hash
+    // and each bucket is numbered with a table that fits in cache. Numbers therefore rise
+    // with the hash, which is also the order of the rename table built at the end.
+    let bits = (links.len() / 2048).max(1).next_power_of_two().trailing_zeros().min(12);
+    let mut buckets: Vec<Vec<(Id, u32)>> = (0..1usize << bits).map(|_| Vec::with_capacity(links.len() * 2 / (1 << bits) * 5 / 4 + 16)).collect();
+    for (i, &(a, b)) in links.iter().enumerate() {
+        buckets[key::partition(key::hash(a), bits)].push((a, 2 * i as u32));
+        buckets[key::partition(key::hash(b), bits)].push((b, 2 * i as u32 + 1));
+    }
+    let mut ids: Vec<Id> = Vec::with_capacity(links.len() * 3 / 2);
+    // The node number of each endpoint: entries 2i and 2i + 1 are the two sides of link i.
+    let mut endpoint = vec![0u32; links.len() * 2];
+    let mut numbered: Vec<(Id, u32)> = Vec::new();
+    for bucket in &buckets {
+        let capacity = (bucket.len() * 2).next_power_of_two().max(16);
+        let shift = 64 - capacity.trailing_zeros();
+        numbered.clear();
+        numbered.resize(capacity, (0, 0));
+        for &(id, slot) in bucket {
+            let mut at = home(key::remix(key::hash(id)), shift);
+            endpoint[slot as usize] = loop {
+                let entry = &mut numbered[at];
+                if entry.0 == id {
+                    break entry.1;
                 }
+                if entry.0 == 0 {
+                    *entry = (id, ids.len() as u32);
+                    ids.push(id);
+                    break entry.1;
+                }
+                at = (at + 1) & (capacity - 1);
             };
-            edges.push([number(a), number(b)]);
         }
     }
-    drop(numbered);
+    drop((buckets, numbered));
 
     // Links step 2: union-find over the link pairs.
     let mut parent: Vec<u32> = (0..ids.len() as u32).collect();
-    for &[a, b] in &edges {
-        let (a, b) = (find(&mut parent, a), find(&mut parent, b));
+    for pair in endpoint.chunks_exact(2) {
+        let (a, b) = (find(&mut parent, pair[0]), find(&mut parent, pair[1]));
         if a != b {
             parent[a.max(b) as usize] = a.min(b);
         }
     }
-    drop(edges);
+    drop(endpoint);
 
     // Links step 3: each person is named by the byte-wise smallest of their IDs.
     let mut name = ids.clone();

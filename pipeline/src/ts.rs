@@ -83,10 +83,15 @@ impl Dates {
     /// `YYYY-MM-DDTHH:MM:SS` in `b[..19]`, to seconds since the epoch.
     #[inline]
     fn datetime_secs(&mut self, b: &[u8]) -> Option<i64> {
-        if b[10] != b'T' || b[13] != b':' || b[16] != b':' {
+        // `HH:MM:SS` as one word. After the XOR a digit byte holds 0 to 9 and a colon byte 0;
+        // adding 0x76 (0x7F for the colons) sets a byte's top bit exactly when it holds more.
+        // A carry can only leave a byte whose own top bit was set, which the OR catches.
+        let t = u64::from_le_bytes(b[11..19].try_into().unwrap()) ^ 0x3030_3A30_303A_3030;
+        if (t.wrapping_add(0x7676_7F76_767F_7676) | t) & 0x8080_8080_8080_8080 != 0 || b[10] != b'T' {
             return None;
         }
-        let (h, mi, s) = (d2(b, 11)?, d2(b, 14)?, d2(b, 17)?);
+        let digit = |i: u32| (t >> (8 * i) & 0xFF) as i64;
+        let (h, mi, s) = (digit(0) * 10 + digit(1), digit(3) * 10 + digit(4), digit(6) * 10 + digit(7));
         if h > 23 || mi > 59 || s > 59 {
             return None;
         }
@@ -118,8 +123,28 @@ impl Dates {
             let local = self.datetime_secs(b)?;
             return Some((if b[19] == b'+' { local - offset } else { local + offset }) * 1000);
         }
+        if n == 13 {
+            // The usual F3: 13 digits, as two overlapping 8-digit words.
+            let high = eight_digits(u64::from_le_bytes(b[..8].try_into().unwrap()))?;
+            let low = eight_digits(u64::from_le_bytes(b[5..].try_into().unwrap()))?;
+            return Some((high / 1000) as i64 * 100_000_000 + low as i64);
+        }
         parse(b)
     }
+}
+
+/// The number written by 8 ASCII digits loaded little-endian (first digit in the low
+/// byte), or `None` if any byte is not a digit.
+#[inline]
+fn eight_digits(word: u64) -> Option<u64> {
+    let x = word ^ 0x3030_3030_3030_3030;
+    if (x.wrapping_add(0x7676_7676_7676_7676) | x) & 0x8080_8080_8080_8080 != 0 {
+        return None;
+    }
+    // Pairs of digits, then pairs of pairs, then the two halves.
+    let x = ((x & 0x000F_000F_000F_000F) * 10) + ((x >> 8) & 0x000F_000F_000F_000F);
+    let x = ((x & 0x0000_00FF_0000_00FF) * 100) + ((x >> 16) & 0x0000_00FF_0000_00FF);
+    Some(((x & 0x0000_0000_0000_FFFF) * 10_000) + ((x >> 32) & 0x0000_0000_0000_FFFF))
 }
 
 /// Parses F1, F2 or F3. `None` for anything else. A digits-only value too large
@@ -237,6 +262,54 @@ mod tests {
                 assert_eq!(dates.parse(s.as_bytes()), parse(s.as_bytes()), "{s:?}");
                 let f1 = if s.len() == 20 && s.ends_with('Z') { parse(s.as_bytes()).map(|ms| ms / 1000) } else { None };
                 assert_eq!(dates.parse_f1_secs(s.as_bytes()), f1, "{s:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn eight_digit_words() {
+        let word = |s: &str| u64::from_le_bytes(s.as_bytes().try_into().unwrap());
+        for s in ["00000000", "00000001", "12345678", "99999999", "90000000", "00000009", "17910718", "71890000"] {
+            assert_eq!(eight_digits(word(s)), Some(s.parse().unwrap()), "{s}");
+        }
+        for s in ["1234567 ", " 2345678", "1234:678", "12345/78", "1234567a", "\u{0}2345678", "123456\u{7f}8", "1234567é"] {
+            if s.len() == 8 {
+                assert_eq!(eight_digits(word(s)), None, "{s:?}");
+            }
+        }
+        // Every single-byte corruption of a valid word is rejected or still all digits.
+        for position in 0..8 {
+            for byte in 0..=255u8 {
+                let mut bytes = *b"48151623";
+                bytes[position] = byte;
+                let want = std::str::from_utf8(&bytes).ok().filter(|s| s.bytes().all(|c| c.is_ascii_digit())).map(|s| s.parse().unwrap());
+                assert_eq!(eight_digits(u64::from_le_bytes(bytes)), want, "{bytes:?}");
+            }
+        }
+    }
+
+    /// Thirteen-byte and clock-time inputs with every byte value in every position.
+    #[test]
+    fn fast_paths_agree_byte_by_byte() {
+        let mut dates = Dates::new();
+        for template in ["1791071890000", "0000000000000", "9999999999999", "2026-10-03T23:58:10Z", "2026-10-03T19:58:10-04:00", "2026-10-03T00:00:00+23:59"] {
+            for position in 0..template.len() {
+                for byte in 0..=255u8 {
+                    let mut bytes = template.as_bytes().to_vec();
+                    bytes[position] = byte;
+                    assert_eq!(dates.parse(&bytes), parse(&bytes), "{:?}", String::from_utf8_lossy(&bytes));
+                    let f1 = if bytes.len() == 20 && bytes[19] == b'Z' { parse(&bytes).map(|ms| ms / 1000) } else { None };
+                    assert_eq!(dates.parse_f1_secs(&bytes), f1, "{:?}", String::from_utf8_lossy(&bytes));
+                }
+            }
+        }
+        // All clock times.
+        for h in 0..30 {
+            for m in (0..70).step_by(7) {
+                for s in [0, 1, 9, 10, 59, 60, 61, 99] {
+                    let text = format!("2026-10-03T{h:02}:{m:02}:{s:02}Z");
+                    assert_eq!(dates.parse(text.as_bytes()), parse(text.as_bytes()), "{text}");
+                }
             }
         }
     }

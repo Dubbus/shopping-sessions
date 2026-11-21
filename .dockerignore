@@ -1,0 +1,11 @@
+target
+data
+output
+scratch
+dev-answer
+spec
+tests
+*.zip
+*.csv
+*.parquet
+.git

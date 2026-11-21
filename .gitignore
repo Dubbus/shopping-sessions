@@ -1,0 +1,12 @@
+/target
+/data
+/output
+/scratch
+/dev-answer
+*.csv
+*.parquet
+*.zip
+perf.data*
+/dev
+/dev-answer
+/spec

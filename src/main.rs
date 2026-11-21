@@ -342,7 +342,7 @@ fn main() {
             if i < nlk {
                 let mut v = Vec::with_capacity(((lk_chunks[i].2 - lk_chunks[i].1) / 20) as usize);
                 lk_files.with_chunk(lk_chunks[i], |chunk| {
-                    scan::for_each2::<2, _>(chunk, |f| {
+                    scan::for_each::<2, _>(chunk, |f| {
                         if !f[0].is_empty() && !f[1].is_empty() {
                             v.push((ids.key(&f[0]), ids.key(&f[1])));
                         }
@@ -372,7 +372,7 @@ fn main() {
                         std::hint::black_box(chunk);
                         return;
                     }
-                    scan::for_each2::<7, _>(chunk, |f| {
+                    scan::for_each::<7, _>(chunk, |f| {
                         if f[0].is_empty() || abl == 1 {
                             return;
                         }
@@ -388,7 +388,7 @@ fn main() {
             } else {
                 let bk = &mut st.ck;
                 ck_files.with_chunk(ck_chunks[i - nev], |chunk| {
-                    scan::for_each2::<4, _>(chunk, |f| {
+                    scan::for_each::<4, _>(chunk, |f| {
                         if f[0].is_empty() || f[1].is_empty() {
                             return;
                         }
@@ -962,7 +962,7 @@ fn field_bench(path: &Path, ids: &Interner, products: &Lookup<u16>, unknown_cat:
     let chunk = &data[body_at..cut];
     let ctx = EvCtx { ids, products, unknown_cat, ws, we, ws_s };
     let mut lines = 0usize;
-    scan::for_each2::<7, _>(chunk, |_| lines += 1);
+    scan::for_each::<7, _>(chunk, |_| lines += 1);
     let reps = 300;
     macro_rules! time {
         ($name:expr, $body:expr) => {{

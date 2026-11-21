@@ -21,7 +21,7 @@ fn specials(w: u64) -> u64 {
         | zero_bytes(w ^ (ONES * b'"' as u64))
 }
 
-/// Per 64-byte block: (separators = ',' | '\n', unused 0, quotes), bit i = byte i.
+/// Per 64-byte block: (separators = ',' | '\n', newlines, quotes), bit i = byte i.
 #[cfg_attr(feature = "prof", inline(never))]
 #[cfg_attr(not(feature = "prof"), inline(always))]
 fn block_masks(b: &[u8; 64]) -> (u64, u64, u64) {
@@ -43,7 +43,9 @@ fn block_masks(b: &[u8; 64]) -> (u64, u64, u64) {
         let s1 = opaque(_mm256_movemask_epi8(_mm256_or_si256(_mm256_cmpeq_epi8(v1, c), _mm256_cmpeq_epi8(v1, n))) as u32);
         let q0 = opaque(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, q)) as u32);
         let q1 = opaque(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, q)) as u32);
-        return (s0 as u64 | (s1 as u64) << 32, 0, q0 as u64 | (q1 as u64) << 32);
+        let n0 = opaque(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, n)) as u32);
+        let n1 = opaque(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, n)) as u32);
+        return (s0 as u64 | (s1 as u64) << 32, n0 as u64 | (n1 as u64) << 32, q0 as u64 | (q1 as u64) << 32);
     }
     #[cfg(target_arch = "aarch64")]
     unsafe {
@@ -59,14 +61,14 @@ fn block_masks(b: &[u8; 64]) -> (u64, u64, u64) {
         let v = [vld1q_u8(b.as_ptr()), vld1q_u8(b.as_ptr().add(16)), vld1q_u8(b.as_ptr().add(32)), vld1q_u8(b.as_ptr().add(48))];
         let eq = |x: u8| { let d = vdupq_n_u8(x); [vceqq_u8(v[0], d), vceqq_u8(v[1], d), vceqq_u8(v[2], d), vceqq_u8(v[3], d)] };
         let (mc, mn, mq) = (fold(eq(b',')), fold(eq(b'\n')), fold(eq(b'"')));
-        return (mc | mn, 0, mq);
+        return (mc | mn, mn, mq);
     }
     #[allow(unreachable_code)]
     {
         let (mut sep, mut nl, mut qt) = (0u64, 0u64, 0u64);
         for (i, &c) in b.iter().enumerate() {
             sep |= ((c == b',' || c == b'\n') as u64) << i;
-            let _ = &mut nl;
+            nl |= ((c == b'\n') as u64) << i;
             qt |= ((c == b'"') as u64) << i;
         }
         (sep, nl, qt)
@@ -204,7 +206,7 @@ pub fn for_each2<const N: usize, F: FnMut(&Line)>(buf: &[u8], mut f: F) {
         let mut qtotal = 0u32;
         for blk in 0..nblocks {
             let pos = blk * 64;
-            let (mut m, _, q) = if pos + 64 <= len {
+            let (mut m, nlmask, q) = if pos + 64 <= len {
                 block_masks(buf[pos..pos + 64].try_into().unwrap())
             } else {
                 let mut t = [0u8; 64];
@@ -216,16 +218,7 @@ pub fn for_each2<const N: usize, F: FnMut(&Line)>(buf: &[u8], mut f: F) {
             qtotal += q.count_ones();
             // newlines in this block, as indexes into the separator array
             let sep = m;
-            let mut nlm = {
-                let mut x = 0u64;
-                let mut mm = sep;
-                while mm != 0 {
-                    let b = mm.trailing_zeros();
-                    mm &= mm - 1;
-                    x |= ((unsafe { *buf.get_unchecked(pos + b as usize) } == b'\n') as u64) << b;
-                }
-                x
-            };
+            let mut nlm = nlmask;
             while nlm != 0 {
                 let b = nlm.trailing_zeros();
                 nlm &= nlm - 1;
@@ -352,7 +345,7 @@ mod tests {
                 *b = b"a,\"\n\rz"[(s2 >> 33) as usize % 6];
             }
             let bit = |p: &dyn Fn(u8) -> bool| blk.iter().enumerate().fold(0u64, |m, (i, &c)| m | ((p(c) as u64) << i));
-            let want = (bit(&|c| c == b',' || c == b'\n'), 0, bit(&|c| c == b'"'));
+            let want = (bit(&|c| c == b',' || c == b'\n'), bit(&|c| c == b'\n'), bit(&|c| c == b'"'));
             assert_eq!(block_masks(&blk), want);
         }
         // random fuzz over a tiny alphabet

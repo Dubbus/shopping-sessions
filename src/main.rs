@@ -113,31 +113,6 @@ fn workers<S: Send, I: Fn() -> S + Sync, F: Fn(&mut S, usize) + Sync>(
     })
 }
 
-/// Run f(i) for i in 0..n on `threads` threads; results in index order.
-fn par<R: Send, F: Fn(usize) -> R + Sync>(n: usize, threads: usize, f: F) -> Vec<R> {
-    let next = AtomicUsize::new(0);
-    let mut out: Vec<(usize, R)> = std::thread::scope(|s| {
-        let hs: Vec<_> = (0..threads.min(n).max(1))
-            .map(|_| {
-                s.spawn(|| {
-                    let mut mine = Vec::new();
-                    loop {
-                        let i = next.fetch_add(1, AO::Relaxed);
-                        if i >= n {
-                            break;
-                        }
-                        mine.push((i, f(i)));
-                    }
-                    mine
-                })
-            })
-            .collect();
-        hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
-    });
-    out.sort_unstable_by_key(|p| p.0);
-    out.into_iter().map(|p| p.1).collect()
-}
-
 fn csv_files(dir: &Path) -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = match std::fs::read_dir(dir) {
         Ok(rd) => rd
@@ -500,14 +475,40 @@ fn main() {
     lap("dedup");
 
     // ---- sessions, credit, assists per person bucket ----
-    let parts: Vec<Part> = par(nb, threads, |b| {
+    // Per-worker scratch reused across buckets (fresh memory costs page faults).
+    #[derive(Default)]
+    struct Sess {
+        local: Option<Table>,
+        keys: Vec<u64>,
+        ev_off: Vec<u32>,
+        pid: Vec<u32>,
+        ev: Vec<PEv>,
+        fill: Vec<u32>,
+        ck_off: Vec<u32>,
+        ck_q: Vec<(u32, Ck)>,
+        ck: Vec<Ck>,
+        users: Vec<UserRow>,
+        camp: Vec<[u64; 4]>,
+        catrev: Vec<u64>,
+        starts: Vec<i64>,
+        sdays: Vec<usize>,
+        run_end: Vec<usize>,
+        by_camp: Vec<(u32, i64)>,
+    }
+    let parts = workers(nb, threads, Sess::default, |st, b| {
+        let Sess { local, keys, ev_off, pid, ev, fill, ck_off, ck_q, ck, users, camp, catrev, starts, sdays, run_end, by_camp } = st;
+        if camp.is_empty() {
+            camp.resize((ncamp + 1) * ndays, [0u64; 4]);
+            catrev.resize(ncats, 0);
+        }
         // Group by person with a counting sort on dense local person numbers, then sort
         // each person's few events by ts. Much cheaper than sorting the bucket by (person, ts).
         let n: usize = deduped.iter().map(|p| p.out[b].len()).sum();
-        let mut local = Table::with_capacity(n / 16 + 16);
-        let mut keys: Vec<u64> = Vec::with_capacity(n / 16 + 16);
-        let mut ev_off: Vec<u32> = Vec::with_capacity(n / 16 + 16);
-        let mut pid: Vec<u32> = Vec::with_capacity(n);
+        let local = local.get_or_insert_with(|| Table::with_capacity(8));
+        local.reset(n / 16 + 16);
+        keys.clear();
+        ev_off.clear();
+        pid.clear();
         for d in &deduped {
             for e in &d.out[b] {
                 let next = keys.len() as u64;
@@ -529,9 +530,11 @@ fn main() {
             acc += c;
         }
         ev_off.push(acc);
-        let mut ev: Vec<PEv> = vec![PEv { person: 0, t: 0, pc: 0 }; n];
+        ev.clear();
+        ev.resize(n, PEv { person: 0, t: 0, pc: 0 });
         {
-            let mut fill: Vec<u32> = ev_off[..m].to_vec();
+            fill.clear();
+            fill.extend_from_slice(&ev_off[..m]);
             let mut k = 0;
             for d in &deduped {
                 for e in &d.out[b] {
@@ -549,8 +552,9 @@ fn main() {
             }
         }
         // Clicks of persons with events, grouped the same way, each group by (ts, click_id).
-        let mut ck_off: Vec<u32> = vec![0; m + 1];
-        let mut ck_q: Vec<(u32, Ck)> = Vec::new();
+        ck_off.clear();
+        ck_off.resize(m + 1, 0);
+        ck_q.clear();
         for p in &deduped {
             for c in &p.ck[b] {
                 if let Some(q) = local.get(c.person) {
@@ -565,10 +569,12 @@ fn main() {
             *o = acc;
             acc += c;
         }
-        let mut ck: Vec<Ck> = vec![Ck { person: 0, ts: 0, cid: 0, camp: 0 }; ck_q.len()];
+        ck.clear();
+        ck.resize(ck_q.len(), Ck { person: 0, ts: 0, cid: 0, camp: 0 });
         {
-            let mut fill: Vec<u32> = ck_off[..m].to_vec();
-            for (q, c) in &ck_q {
+            fill.clear();
+            fill.extend_from_slice(&ck_off[..m]);
+            for (q, c) in ck_q.iter() {
                 ck[fill[*q as usize] as usize] = *c;
                 fill[*q as usize] += 1;
             }
@@ -579,14 +585,6 @@ fn main() {
                 r.sort_unstable_by(|a, c| a.ts.cmp(&c.ts).then_with(|| ids.cmp(a.cid, c.cid)));
             }
         }
-
-        let mut users = Vec::new();
-        let mut camp = vec![[0u64; 4]; (ncamp + 1) * ndays];
-        let mut catrev = vec![0u64; ncats];
-        let mut starts: Vec<i64> = Vec::new();
-        let mut sdays: Vec<usize> = Vec::new();
-        let mut run_end: Vec<usize> = Vec::new();
-        let mut by_camp: Vec<(u32, i64)> = Vec::new();
 
         for q in 0..m {
             let p = keys[q];
@@ -602,7 +600,7 @@ fn main() {
                 let start = ws + ev[j].t as i64;
                 let day = start.div_euclid(DAY);
                 if cur.as_ref().is_some_and(|u| u.day as i64 != day) {
-                    users.push(finish(cur.take().unwrap(), &mut catrev));
+                    users.push(finish(cur.take().unwrap(), catrev));
                 }
                 let mut last = start;
                 let (mut n, mut rev, mut purch) = (0u64, 0u64, false);
@@ -653,7 +651,7 @@ fn main() {
                 a[2] += rev;
             }
             if let Some(u) = cur.take() {
-                users.push(finish(u, &mut catrev));
+                users.push(finish(u, catrev));
             }
 
             // assists: per campaign, union of [click, click + 7d] intervals over session starts
@@ -707,9 +705,9 @@ fn main() {
                 }
             }
         }
-        Part { users, camp }
     });
     lap("sessions");
+    let parts: Vec<Part> = parts.into_iter().map(|s| Part { users: s.users, camp: s.camp }).collect();
 
     write_outputs(&out, &parts, &ids, &cat_names, &camp_ids, &camp_channels, first_day, ndays)
         .expect("write outputs");
@@ -781,6 +779,39 @@ fn build_persons(lk_files: &Files, ids: &Interner) -> Table {
     person_of
 }
 
+fn write_users(path: &Path, users: &[UserRow], ids: &Interner, cats: &[Vec<u8>]) -> std::io::Result<()> {
+    let mut uid = Data::str();
+    let mut top = Data::opt_str();
+    let n = users.len();
+    let (mut day, mut ses, mut evs, mut rev) =
+        (Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n));
+    let mut buf = Vec::new();
+    for u in users {
+        buf.clear();
+        ids.bytes(u.person, &mut buf);
+        uid.push_str(&buf);
+        day.push(u.day);
+        ses.push(u.sessions as i64);
+        evs.push(u.events as i64);
+        rev.push(u.revenue as i64);
+        match u.top {
+            Some(c) => top.push_str(&cats[c as usize]),
+            None => top.push_null(),
+        }
+    }
+    parquet::write(
+        path,
+        &[
+            Column { name: "user_id", data: uid },
+            Column { name: "day", data: Data::Date(day) },
+            Column { name: "sessions", data: Data::I64(ses) },
+            Column { name: "events", data: Data::I64(evs) },
+            Column { name: "revenue_cents", data: Data::I64(rev) },
+            Column { name: "top_category", data: top },
+        ],
+    )
+}
+
 /// Close a user-day: top category = highest summed price, tie -> smallest (sorted) name.
 fn finish(mut u: UserRow, catrev: &mut [u64]) -> UserRow {
     let mut best: Option<(u64, u16)> = None;
@@ -815,34 +846,21 @@ fn write_outputs(
     std::fs::create_dir_all(&ud)?;
     std::fs::create_dir_all(&cd)?;
 
-    let mut uid = Data::str();
-    let mut top = Data::opt_str();
-    let (mut day, mut ses, mut evs, mut rev) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    let mut buf = Vec::new();
-    for u in parts.iter().flat_map(|p| p.users.iter()) {
-        buf.clear();
-        ids.bytes(u.person, &mut buf);
-        uid.push_str(&buf);
-        day.push(u.day);
-        ses.push(u.sessions as i64);
-        evs.push(u.events as i64);
-        rev.push(u.revenue as i64);
-        match u.top {
-            Some(c) => top.push_str(&cats[c as usize]),
-            None => top.push_null(),
+    // One user_daily file per worker, written in parallel.
+    std::thread::scope(|sc| -> std::io::Result<()> {
+        let hs: Vec<_> = parts
+            .iter()
+            .enumerate()
+            .map(|(w, p)| {
+                let path = ud.join(format!("part-{w:03}.parquet"));
+                sc.spawn(move || write_users(&path, &p.users, ids, cats))
+            })
+            .collect();
+        for h in hs {
+            h.join().unwrap()?;
         }
-    }
-    parquet::write(
-        &ud.join("part-0.parquet"),
-        &[
-            Column { name: "user_id", data: uid },
-            Column { name: "day", data: Data::Date(day) },
-            Column { name: "sessions", data: Data::I64(ses) },
-            Column { name: "events", data: Data::I64(evs) },
-            Column { name: "revenue_cents", data: Data::I64(rev) },
-            Column { name: "top_category", data: top },
-        ],
-    )?;
+        Ok(())
+    })?;
 
     let ncamp = camp_ids.len();
     let mut tot = vec![[0u64; 4]; (ncamp + 1) * ndays];

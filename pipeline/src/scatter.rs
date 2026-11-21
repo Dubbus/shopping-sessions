@@ -62,13 +62,9 @@ unsafe fn stream(from: *const u8, to: *mut u8, lines: usize) {
     }
 }
 
-/// One thread's writer. `T` must be plain data whose size divides a few cache lines evenly
-/// (32 or 48 bytes here).
+/// One thread's writer. `T` must be plain data whose size tiles a few cache lines evenly
+/// (24 or 32 bytes here). Everything about the layout is a compile-time constant of `T`.
 pub struct Scatter<T> {
-    /// Records per staging line, and the line's size in bytes (a multiple of 64).
-    per_line: usize,
-    line: usize,
-    block: usize,
     stage: *mut u8,
     /// Records staged per partition.
     staged: Vec<u8>,
@@ -84,17 +80,24 @@ pub struct Scatter<T> {
 unsafe impl<T: Send> Send for Scatter<T> {}
 
 impl<T: Copy> Scatter<T> {
+    const SIZE: usize = std::mem::size_of::<T>();
+    /// Records per staging line: the smallest run of records that fills whole cache lines.
+    const PER_LINE: usize = {
+        let mut n = 1;
+        while (n * Self::SIZE) % 64 != 0 {
+            n += 1;
+            assert!(n <= 8, "record size must tile cache lines");
+        }
+        n
+    };
+    /// A staging line's size in bytes, a multiple of 64.
+    const LINE: usize = Self::PER_LINE * Self::SIZE;
+    const BLOCK: usize = BLOCK / Self::LINE * Self::LINE;
+
     pub fn new(parts: usize) -> Self {
-        let size = std::mem::size_of::<T>();
-        // The smallest run of records that fills whole cache lines.
-        let per_line = (1..=8).find(|n| (n * size) % 64 == 0).expect("record size must tile cache lines");
-        let line = per_line * size;
         let mut arena = Arena { next: std::ptr::null_mut(), end: std::ptr::null_mut() };
-        let stage = arena.alloc((parts * line).next_multiple_of(64));
+        let stage = arena.alloc((parts * Self::LINE).next_multiple_of(64));
         Scatter {
-            per_line,
-            line,
-            block: (BLOCK / line).max(1) * line,
             stage,
             staged: vec![0; parts],
             at: vec![std::ptr::null_mut(); parts],
@@ -107,57 +110,73 @@ impl<T: Copy> Scatter<T> {
 
     #[inline]
     pub fn push(&mut self, part: usize, record: T) {
-        // SAFETY: `part` is checked by the indexing below; the staging line has room for
-        // `per_line` records and `staged[part] < per_line`.
+        assert!(part < self.staged.len());
+        // SAFETY: `part` is in range for every per-partition array; the staging line has
+        // room for `PER_LINE` records and holds fewer than that.
         unsafe {
-            let n = self.staged[part] as usize;
-            let line = self.stage.add(part * self.line);
-            (line.add(n * std::mem::size_of::<T>()) as *mut T).write_unaligned(record);
-            if n + 1 == self.per_line {
-                self.staged[part] = 0;
+            let staged = self.staged.get_unchecked_mut(part);
+            let n = *staged as usize;
+            let line = self.stage.add(part * Self::LINE);
+            (line.add(n * Self::SIZE) as *mut T).write_unaligned(record);
+            if n + 1 == Self::PER_LINE {
+                *staged = 0;
                 let to = self.room(part);
-                stream(line, to, self.line / 64);
+                stream(line, to, Self::LINE / 64);
             } else {
-                self.staged[part] = n as u8 + 1;
+                *staged = n as u8 + 1;
             }
         }
     }
 
     /// Where the next full line of `part` goes, starting a new block if the current one is full.
+    ///
+    /// # Safety
+    /// `part` must be in range.
     #[inline]
-    fn room(&mut self, part: usize) -> *mut u8 {
-        if self.at[part] == self.end[part] {
-            let block = self.arena.alloc(self.block);
-            self.blocks[part].push(block);
-            self.at[part] = block;
-            self.end[part] = unsafe { block.add(self.block) };
+    unsafe fn room(&mut self, part: usize) -> *mut u8 {
+        unsafe {
+            let at = self.at.get_unchecked_mut(part);
+            if *at == *self.end.get_unchecked(part) {
+                return self.new_block(part);
+            }
+            let to = *at;
+            *at = to.add(Self::LINE);
+            to
         }
-        let to = self.at[part];
-        self.at[part] = unsafe { to.add(self.line) };
-        to
+    }
+
+    #[cold]
+    fn new_block(&mut self, part: usize) -> *mut u8 {
+        let block = self.arena.alloc(Self::BLOCK);
+        self.blocks[part].push(block);
+        self.at[part] = unsafe { block.add(Self::LINE) };
+        self.end[part] = unsafe { block.add(Self::BLOCK) };
+        block
     }
 
     /// Writes out the partly filled lines and returns what was scattered.
     pub fn finish(mut self) -> Scattered<T> {
-        let size = std::mem::size_of::<T>();
         let mut counts = Vec::with_capacity(self.staged.len());
         for part in 0..self.staged.len() {
             let left = self.staged[part] as usize;
             let full = match self.blocks[part].len() {
                 0 => 0,
-                n => (n - 1) * self.block + (self.at[part] as usize - self.blocks[part][n - 1] as usize),
+                n => (n - 1) * Self::BLOCK + (self.at[part] as usize - self.blocks[part][n - 1] as usize),
             };
             if left > 0 {
-                let to = self.room(part);
-                unsafe { std::ptr::copy_nonoverlapping(self.stage.add(part * self.line), to, left * size) };
+                // SAFETY: `part` is in range, and the line holds `left` records.
+                unsafe {
+                    let to = self.room(part);
+                    std::ptr::copy_nonoverlapping(self.stage.add(part * Self::LINE), to, left * Self::SIZE);
+                }
             }
-            counts.push(full / size + left);
+            counts.push(full / Self::SIZE + left);
         }
         #[cfg(target_arch = "x86_64")]
         unsafe {
             std::arch::x86_64::_mm_sfence();
         }
-        Scattered { per_block: self.block / size, blocks: std::mem::take(&mut self.blocks), counts, kind: PhantomData }
+        Scattered { per_block: Self::BLOCK / Self::SIZE, blocks: std::mem::take(&mut self.blocks), counts, kind: PhantomData }
     }
 }
 

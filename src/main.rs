@@ -434,6 +434,8 @@ fn main() {
     struct DedupState {
         best: Table,
         dead: Vec<u64>,
+        seen: Vec<u64>,
+        multi: Vec<u64>,
         out: Vec<Vec<PEv>>,
         ck: Vec<Vec<Ck>>,
     }
@@ -443,6 +445,8 @@ fn main() {
         || DedupState {
             best: Table::with_capacity(8),
             dead: Vec::new(),
+            seen: Vec::new(),
+            multi: Vec::new(),
             out: (0..nb).map(|_| Vec::with_capacity(pev_cap)).collect(),
             ck: (0..nb).map(|_| Vec::new()).collect(),
         },
@@ -464,37 +468,57 @@ fn main() {
             let b = b - threads;
             let parts: Vec<&[Ev]> = parsed.iter().map(|p| &p.ev[b][..]).collect();
             let n: usize = parts.iter().map(|p| p.len()).sum();
-            let best = &mut st.best;
-            best.reset(n);
-            // One probe per event: when two copies meet, the loser is marked dead.
+            // Pass 1: two cache-sized bitmaps over a hash of event_id find every event whose
+            // hash bit was hit twice. Events outside that set are certainly unique; only the
+            // candidates (~3% true duplicates + hash collisions) go through the exact table.
+            let mbits = (n.max(64) * 6).next_power_of_two();
+            let shift = 64 - mbits.trailing_zeros();
+            let hbit = |k: u64| -> usize { (k.wrapping_mul(0xD6E8_FEB8_6659_FD93) >> shift) as usize };
+            let (seen, multi) = (&mut st.seen, &mut st.multi);
+            seen.clear();
+            seen.resize(mbits / 64, 0);
+            multi.clear();
+            multi.resize(mbits / 64, 0);
+            for part in &parts {
+                for e in part.iter() {
+                    let h = hbit(e.eid);
+                    let (w, m) = (h / 64, 1u64 << (h % 64));
+                    multi[w] |= seen[w] & m;
+                    seen[w] |= m;
+                }
+            }
+            // Pass 2 (candidates only): exact dedup, smallest ingest_ts wins; losers marked dead.
             let dead = &mut st.dead;
             dead.clear();
             dead.resize(n.div_ceil(64), 0);
+            let best = &mut st.best;
+            best.reset(n / 4 + 64);
+            let mut g = 0usize;
+            for part in &parts {
+                for e in part.iter() {
+                    let h = hbit(e.eid);
+                    if multi[h / 64] >> (h % 64) & 1 == 1 {
+                        let (slot, new) = best.entry(e.eid, ((g as u64) << 32) | e.ingest as u64);
+                        if !new {
+                            let old = *slot;
+                            let (og, oi) = ((old >> 32) as usize, old as u32);
+                            let loser = if oi > e.ingest {
+                                *slot = ((g as u64) << 32) | e.ingest as u64;
+                                og
+                            } else {
+                                g
+                            };
+                            dead[loser / 64] |= 1 << (loser % 64);
+                        }
+                    }
+                    g += 1;
+                }
+            }
             let mut base = Vec::with_capacity(parts.len());
             let mut acc = 0usize;
             for p in &parts {
                 base.push(acc);
                 acc += p.len();
-            }
-            let ev_at = |g: usize| -> &Ev {
-                let w = base.partition_point(|&b| b <= g) - 1;
-                &parts[w][g - base[w]]
-            };
-            for (w, part) in parts.iter().enumerate() {
-                for (i, e) in part.iter().enumerate() {
-                    let g = base[w] + i;
-                    let (slot, new) = best.entry(e.eid, g as u64);
-                    if !new {
-                        let old = *slot as usize;
-                        let loser = if ev_at(old).ingest > e.ingest {
-                            *slot = g as u64;
-                            old
-                        } else {
-                            g
-                        };
-                        dead[loser / 64] |= 1 << (loser % 64);
-                    }
-                }
             }
             const AHEAD: usize = 16;
             for (w, part) in parts.iter().enumerate() {

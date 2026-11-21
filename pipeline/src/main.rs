@@ -149,6 +149,9 @@ impl Parsed {
     /// "Links come before everything else": the user ID becomes the person.
     #[inline]
     fn settle_clicks(&mut self, renames: &link::Renames, person_bits: u32) {
+        for click in &self.waiting_clicks {
+            renames.prefetch_slot(click.who);
+        }
         for mut click in self.waiting_clicks.drain(..) {
             click.who = renames.person(click.who);
             self.clicks.push(partition(key::hash(click.who), person_bits), click);
@@ -242,7 +245,7 @@ fn parse_click(&[id, user, campaign, ts]: &[&[u8]; 4], ctx: &Ctx, renames: &link
         return;
     }
     let who = unsafe { key::id(user) };
-    renames.prefetch(who);
+    renames.prefetch_tag(who);
     out.waiting_clicks.push(Click { who, id: unsafe { key::id(id) }, ts: (t - ctx.base) as u32, campaign });
     if out.waiting_clicks.len() == BATCH {
         out.settle_clicks(renames, ctx.person_bits);
@@ -618,10 +621,12 @@ fn main() -> Res<()> {
         /// arrive, it gets its person and goes to that person's partition.
         #[inline]
         fn keep(&mut self, event: &Event, renames: &link::Renames, person_bits: u32) {
-            renames.prefetch(event.user);
+            renames.prefetch_tag(event.user);
             let slot = self.next % AHEAD;
             if self.next >= AHEAD {
                 self.settle(slot, renames, person_bits);
+                // Halfway through its wait, a survivor's tag is here: fetch its slot if needed.
+                renames.prefetch_slot(self.waiting[(slot + AHEAD / 2) % AHEAD].who);
             }
             self.waiting[slot] = Survivor { who: event.user, ts: event.ts, price: (event.ingest_price & 0xFF_FFFF) as u32, category: event.category & !VALID, pad: 0 };
             self.next += 1;

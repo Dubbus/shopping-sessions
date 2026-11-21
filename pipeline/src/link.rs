@@ -5,8 +5,14 @@ use crate::key::{self, Id};
 
 /// ID -> person name, for the IDs that are not themselves their person's name.
 /// An ID that is not in the table is a person on its own, or is the name already.
+///
+/// Most lookups are for such IDs, and the table is far bigger than the cache, so each slot
+/// has a one-byte tag in a separate, much smaller array: a lookup reads tags only, and goes
+/// to the table itself just when a tag matches.
 pub struct Renames {
-    /// Open addressing on the top bits of `key::hash`. An empty slot holds 0, which is no ID.
+    /// Per slot: 0 if empty, else a nonzero byte of the ID's hash.
+    tags: Vec<u8>,
+    /// Open addressing on the top bits of `key::hash`.
     slots: Vec<[Id; 2]>,
     shift: u32,
 }
@@ -15,6 +21,12 @@ pub struct Renames {
 #[inline]
 fn home(hash: u64, shift: u32) -> usize {
     (hash >> shift) as usize
+}
+
+/// A nonzero byte from hash bits the slot index does not use.
+#[inline]
+fn tag(hash: u64) -> u8 {
+    hash as u8 | 1
 }
 
 #[inline]
@@ -31,25 +43,39 @@ fn prefetch<T>(slot: *const T) {
 impl Renames {
     fn new(pairs: &[(Id, Id)]) -> Renames {
         if pairs.is_empty() {
-            return Renames { slots: Vec::new(), shift: 0 };
+            return Renames { tags: Vec::new(), slots: Vec::new(), shift: 0 };
         }
         let capacity = (pairs.len() * 2).next_power_of_two().max(16);
-        let mut table = Renames { slots: vec![[0; 2]; capacity], shift: 64 - capacity.trailing_zeros() };
+        let mut table = Renames { tags: vec![0; capacity], slots: vec![[0; 2]; capacity], shift: 64 - capacity.trailing_zeros() };
         for &(id, name) in pairs {
-            let mut at = home(key::hash(id), table.shift);
-            while table.slots[at][0] != 0 {
+            let hash = key::hash(id);
+            let mut at = home(hash, table.shift);
+            while table.tags[at] != 0 {
                 at = (at + 1) & (capacity - 1);
             }
+            table.tags[at] = tag(hash);
             table.slots[at] = [id, name];
         }
         table
     }
 
-    /// Starts loading the slot a later [`Renames::person`] call for this ID will read.
+    /// First of two steps before a [`Renames::person`] call: start loading the ID's tag.
     #[inline]
-    pub fn prefetch(&self, id: Id) {
+    pub fn prefetch_tag(&self, id: Id) {
         if !self.slots.is_empty() {
-            prefetch(self.slots.as_ptr().wrapping_add(home(key::hash(id), self.shift)));
+            prefetch(self.tags.as_ptr().wrapping_add(home(key::hash(id), self.shift)));
+        }
+    }
+
+    /// Second step, once the tag has had time to arrive: if it matches, start loading the slot.
+    #[inline]
+    pub fn prefetch_slot(&self, id: Id) {
+        if !self.slots.is_empty() {
+            let hash = key::hash(id);
+            let at = home(hash, self.shift);
+            if self.tags[at] == tag(hash) {
+                prefetch(self.slots.as_ptr().wrapping_add(at));
+            }
         }
     }
 
@@ -59,14 +85,16 @@ impl Renames {
         if self.slots.is_empty() {
             return id;
         }
-        let mut at = home(key::hash(id), self.shift);
+        let hash = key::hash(id);
+        let wanted = tag(hash);
+        let mut at = home(hash, self.shift);
         loop {
-            let slot = &self.slots[at];
-            if slot[0] == id {
-                return slot[1];
-            }
-            if slot[0] == 0 {
+            let found = self.tags[at];
+            if found == 0 {
                 return id;
+            }
+            if found == wanted && self.slots[at][0] == id {
+                return self.slots[at][1];
             }
             at = (at + 1) & (self.slots.len() - 1);
         }

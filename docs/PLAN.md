@@ -318,3 +318,11 @@ byte value in every position): `ingest_ts` and `ts` converted 8 at a time with g
 Cascade Lake and the batching costs more than it saves; the date cache already makes the scalar
 path cheap. Dropped. (A bug found on the way: 20- and 25-character all-digit values are F3, so
 the form must be decided by `b[4] == '-'`, not the length.)
+
+**Also ruled out (ss-bench, 4 alternating rounds, 20M):** `MADV_POPULATE_READ` per mapped chunk
+(about +1%, worse), pinning each worker to one CPU (no change, 1.10 s either way).
+
+**Kept:** event chunks read from a mapping of the file instead of `pread` (-1.8%, `246d003`).
+
+**Safety at final size:** 60M events (seed 9) native on ss-bench: 3.57 s, peak RSS 6.5 GB
+(mapped input included). Output identical to `master`'s independent implementation.

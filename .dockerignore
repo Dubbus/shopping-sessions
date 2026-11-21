@@ -1,4 +1,6 @@
-# The image is built from pipeline/ alone.
+# The image is built from pipeline/ and the dataset generator (for the training run).
 *
 !pipeline/
+!tools/
 pipeline/target/
+tools/generator/target/

@@ -360,7 +360,7 @@ fn main() {
                     std::thread::yield_now();
                 }
                 let pairs = std::mem::take(&mut *lk_pairs.lock().unwrap());
-                let _ = person_slot.set(build_persons(&pairs, &ids, nb));
+                let _ = person_slot.set(build_persons(&pairs, &ids));
                 eprintln!("{:>8.3}s links done", t0.elapsed().as_secs_f64());
                 return;
             }
@@ -407,6 +407,8 @@ fn main() {
     if abl != 0 {
         std::process::exit(0);
     }
+    let person_of = person_slot.into_inner().expect("links task ran");
+    let person = |uid: u64| -> u64 { person_of.get(uid).unwrap_or(uid) };
 
     // ---- dedup by event_id (smallest ingest_ts wins), resolve person, re-bucket ----
     let pev_cap = (ev_bytes / 70 / (threads * nb) as u64) as usize * 11 / 10 + 64;
@@ -433,9 +435,19 @@ fn main() {
         },
         |st, b| {
             if b < threads {
-                // one worker's raw clicks, bucketed by raw user ID (resolved in the next stage)
-                for c in &parsed[b].ck {
-                    st.ck[bucket(c.person, nb)].push(*c);
+                // one worker's raw clicks: resolve person, bucket by person
+                let raw = &parsed[b].ck;
+                const AHEAD: usize = 16;
+                for i in 0..raw.len() {
+                    if let Some(x) = raw.get(i + 2 * AHEAD) {
+                        person_of.prefetch_filter(x.person);
+                    }
+                    if i + AHEAD < raw.len() {
+                        person_of.prefetch(raw[i + AHEAD].person);
+                    }
+                    let mut c = raw[i];
+                    c.person = person(c.person);
+                    st.ck[bucket(c.person, nb)].push(c);
                 }
                 return;
             }
@@ -497,14 +509,24 @@ fn main() {
                 base.push(acc);
                 acc += p.len();
             }
+            const AHEAD: usize = 16;
             for (w, part) in parts.iter().enumerate() {
                 for i in 0..part.len() {
+                    if let Some(x) = part.get(i + 2 * AHEAD)
+                        && x.ok()
+                    {
+                        person_of.prefetch_filter(x.person);
+                    }
+                    if i + AHEAD < part.len() && part[i + AHEAD].ok() {
+                        person_of.prefetch(part[i + AHEAD].person);
+                    }
                     let e = &part[i];
                     let g = base[w] + i;
                     if !e.ok() || dead[g / 64] >> (g % 64) & 1 == 1 {
                         continue;
                     }
-                    st.out[bucket(e.person, nb)].push(PEv { person: e.person, t: e.t, pc: e.pc }); // raw user ID
+                    let p = person(e.person);
+                    st.out[bucket(p, nb)].push(PEv { person: p, t: e.t, pc: e.pc });
                 }
             }
             let t3 = tt.elapsed().as_nanos() as u64;
@@ -523,32 +545,6 @@ fn main() {
         eprintln!("dedup thread-ms: bitmaps {} candidates {} emit {}", t[0] / 1_000_000, t[1] / 1_000_000, t[2] / 1_000_000);
     }
     lap("dedup");
-
-    // ---- resolve persons per user-ID bucket (partition-local lookups), re-bucket by person ----
-    let person_of = person_slot.get().expect("links task ran");
-    struct ResState {
-        out: Vec<Vec<PEv>>,
-        ck: Vec<Vec<Ck>>,
-    }
-    let resolved = workers(
-        nb,
-        threads,
-        || ResState { out: (0..nb).map(|_| Vec::with_capacity(pev_cap)).collect(), ck: (0..nb).map(|_| Vec::new()).collect() },
-        |st, b| {
-            let t = person_of.part(b);
-            for d in &deduped {
-                for e in &d.out[b] {
-                    let p = t.get(e.person).unwrap_or(e.person);
-                    st.out[bucket(p, nb)].push(PEv { person: p, t: e.t, pc: e.pc });
-                }
-                for c in &d.ck[b] {
-                    let p = t.get(c.person).unwrap_or(c.person);
-                    st.ck[bucket(p, nb)].push(Ck { person: p, ..*c });
-                }
-            }
-        },
-    );
-    lap("resolve");
 
     // ---- sessions, credit, assists per person bucket ----
     // Per-worker scratch reused across buckets (fresh memory costs page faults).
@@ -579,13 +575,13 @@ fn main() {
         }
         // Group by person with a counting sort on dense local person numbers, then sort
         // each person's few events by ts. Much cheaper than sorting the bucket by (person, ts).
-        let n: usize = resolved.iter().map(|p| p.out[b].len()).sum();
+        let n: usize = deduped.iter().map(|p| p.out[b].len()).sum();
         let local = local.get_or_insert_with(|| Table::with_capacity(8));
         local.reset(n / 16 + 16);
         keys.clear();
         ev_off.clear();
         pid.clear();
-        for d in &resolved {
+        for d in &deduped {
             for e in &d.out[b] {
                 let next = keys.len() as u64;
                 let (slot, new) = local.entry(e.person, next);
@@ -612,7 +608,7 @@ fn main() {
             fill.clear();
             fill.extend_from_slice(&ev_off[..m]);
             let mut k = 0;
-            for d in &resolved {
+            for d in &deduped {
                 for e in &d.out[b] {
                     let q = pid[k] as usize;
                     k += 1;
@@ -631,7 +627,7 @@ fn main() {
         ck_off.clear();
         ck_off.resize(m + 1, 0);
         ck_q.clear();
-        for p in &resolved {
+        for p in &deduped {
             for c in &p.ck[b] {
                 if let Some(q) = local.get(c.person) {
                     ck_off[q as usize] += 1;
@@ -794,21 +790,52 @@ fn main() {
 
 /// Union-find over the link files; the table maps an ID to its person's name (the
 /// byte-wise smallest ID) for every ID not named by itself.
-/// ID -> person name for IDs not named by themselves, split into `np` partitions by
-/// `bucket(id, np)`. Records are resolved one ID-bucket at a time, so each lookup hits a
-/// partition small enough (~256 KiB) to stay in L2 instead of missing into one big table.
+/// ID -> person name for IDs not named by themselves: a dense table plus a small
+/// in-cache filter bitmap, so most IDs (unlinked, or the person's own name) skip the table.
 struct Persons {
-    parts: Vec<Table>,
+    table: Table,
+    filter: Vec<u64>,
+    fshift: u32,
 }
 
 impl Persons {
+    fn new(n: usize) -> Self {
+        let bits = (n.max(64) * 10).next_power_of_two();
+        Persons { table: Table::dense(n), filter: vec![0; bits / 64], fshift: 64 - bits.trailing_zeros() }
+    }
     #[inline(always)]
-    fn part(&self, b: usize) -> &Table {
-        &self.parts[b]
+    fn fbit(&self, k: u64) -> usize {
+        (k.wrapping_mul(0xA24B_AED4_963E_E407) >> self.fshift) as usize
+    }
+    fn insert(&mut self, k: u64, v: u64) {
+        let b = self.fbit(k);
+        self.filter[b / 64] |= 1 << (b % 64);
+        self.table.entry(k, v);
+    }
+    #[inline(always)]
+    fn may_have(&self, k: u64) -> bool {
+        let b = self.fbit(k);
+        self.filter[b / 64] >> (b % 64) & 1 == 1
+    }
+    #[inline(always)]
+    fn get(&self, k: u64) -> Option<u64> {
+        if self.may_have(k) { self.table.get(k) } else { None }
+    }
+    /// Stage 1 of a two-stage prefetch: bring in the filter word.
+    #[inline(always)]
+    fn prefetch_filter(&self, k: u64) {
+        prefetch_read(&self.filter[self.fbit(k) / 64]);
+    }
+    /// Stage 2: the filter word should be cached by now; prefetch the table slot if needed.
+    #[inline(always)]
+    fn prefetch(&self, k: u64) {
+        if self.may_have(k) {
+            self.table.prefetch(k);
+        }
     }
 }
 
-fn build_persons(pairs: &[(u64, u64)], ids: &Interner, np: usize) -> Persons {
+fn build_persons(pairs: &[(u64, u64)], ids: &Interner) -> Persons {
     let npairs = pairs.len();
     let tl = std::time::Instant::now();
     eprintln!("links: {npairs} pairs parsed");
@@ -864,16 +891,12 @@ fn build_persons(pairs: &[(u64, u64)], ids: &Interner, np: usize) -> Persons {
             mapped.push((node_key[n], name));
         }
     }
-    let mut counts = vec![0usize; np];
-    for &(k, _) in &mapped {
-        counts[bucket(k, np)] += 1;
-    }
-    let mut parts: Vec<Table> = counts.iter().map(|&c| Table::dense(c)).collect();
+    let mut person_of = Persons::new(mapped.len());
     for &(k, v) in &mapped {
-        parts[bucket(k, np)].entry(k, v);
+        person_of.insert(k, v);
     }
     eprintln!("links: names+table {:.3}s", tl.elapsed().as_secs_f64());
-    Persons { parts }
+    person_of
 }
 
 fn write_users(path: &Path, users: &[UserRow], ids: &Interner, cats: &[Vec<u8>]) -> std::io::Result<()> {

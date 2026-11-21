@@ -320,7 +320,8 @@ fn main() {
         ev: Vec<Vec<Ev>>,
         ck: Vec<Ck>,
     }
-    // ABL (benchmarking only): 1 = scan events but skip field work, 2 = skip the bucket store
+    // ABL (benchmarking only): 1 = scan events but skip field work, 2 = skip the bucket
+    // store, 3 = full parse then exit, 4 = only read event chunks
     let abl: u32 = std::env::var("ABL").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     let ectx = EvCtx { ids: &ids, products: &products, unknown_cat, ws, we, ws_s };
     // Items: link chunks, then the union-find (waits for them), then events, then clicks.
@@ -358,6 +359,10 @@ fn main() {
             if i < nev {
                 let bk = &mut st.ev;
                 ev_files.with_chunk(ev_chunks[i], |chunk| {
+                    if abl == 4 {
+                        std::hint::black_box(chunk);
+                        return;
+                    }
                     scan::for_each::<7, _>(chunk, |f| {
                         if f[0].is_empty() || abl == 1 {
                             return;

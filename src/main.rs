@@ -35,22 +35,31 @@ const PURCHASE: u8 = 2;
 #[derive(Clone, Copy)]
 struct Ev {
     eid: u64,
-    ingest: i64,
-    ts: i64,
-    person: u64,
-    price: u32,
-    cat: u16,
-    kind: u8,
-    ok: bool,
+    person: u64, // raw user ID until dedup
+    /// ingest_ts in seconds, offset so u32 order = time order for +-68 years around the window
+    ingest: u32,
+    /// ts in ms since window_start (valid events only)
+    t: u32,
+    /// price | category << 24 for a purchase, category only otherwise; NOT_OK if invalid
+    pc: u32,
+    _pad: u32,
+}
+
+const NOT_OK: u32 = u32::MAX;
+const PRICE_MASK: u32 = 0xFF_FFFF;
+
+impl Ev {
+    #[inline(always)]
+    fn ok(&self) -> bool {
+        self.pc != NOT_OK
+    }
 }
 
 #[derive(Clone, Copy)]
 struct PEv {
     person: u64,
-    ts: i64,
-    price: u32,
-    cat: u16,
-    kind: u8,
+    t: u32,  // ms since window_start
+    pc: u32, // as Ev::pc; price 0 = not a purchase
 }
 
 #[derive(Clone, Copy)]
@@ -258,6 +267,8 @@ fn main() {
     let we = json_ts(&manifest, "window_end");
     let first_day = ws.div_euclid(DAY);
     let ndays = ((we - 1).div_euclid(DAY) - first_day + 1) as usize;
+    let ws_s = ws.div_euclid(1000);
+    assert!(we - ws <= u32::MAX as i64, "window longer than 49 days: ts offsets need u32");
 
     let mut cat_names: Vec<Vec<u8>> = vec![b"unknown".to_vec()];
     let mut prod_raw: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
@@ -280,6 +291,7 @@ fn main() {
     }
     products.finish();
     let ncats = cat_names.len();
+    assert!(ncats <= 255, "more than 255 categories: packed price|category needs widening");
 
     let mut camp_ids: Vec<Vec<u8>> = Vec::new();
     let mut camp_channels: Vec<Vec<u8>> = Vec::new();
@@ -346,7 +358,12 @@ fn main() {
                             return;
                         }
                         let eid = ids.key(f[0]);
-                        let ingest = ts::parse(f[3]).unwrap_or(i64::MAX);
+                        let ingest_ms = ts::parse(f[3]);
+                        let ingest = match ingest_ms {
+                            Some(x) => (x.div_euclid(1000) - ws_s + (1 << 31)).clamp(0, u32::MAX as i64 - 1) as u32,
+                            None => u32::MAX,
+                        };
+                        let ingest_ms = ingest_ms.unwrap_or(i64::MAX);
                         let t = ts::parse(f[2]);
                         let kind = match f[4] {
                             b"view" => VIEW,
@@ -354,22 +371,21 @@ fn main() {
                             b"purchase" => PURCHASE,
                             _ => u8::MAX,
                         };
-                        let mut e = Ev { eid, ingest, ts: 0, person: 0, price: 0, cat: 0, kind, ok: false };
+                        let mut e = Ev { eid, person: 0, ingest, t: 0, pc: NOT_OK, _pad: 0 };
                         if let Some(t) = t
                             && !f[1].is_empty()
                             && t >= ws
                             && t < we
                             && kind != u8::MAX
                             && !f[5].is_empty()
-                            && ingest - t <= LATE
+                            && ingest_ms - t <= LATE
                         {
                             let p = if kind == PURCHASE { price(f[6]) } else { Some(0) };
                             if let Some(p) = p {
-                                e.ok = true;
-                                e.ts = t;
-                                e.price = p;
-                                e.cat = products.get(f[5]).unwrap_or(unknown_cat);
-                                e.person = ids.key(f[1]); // raw user ID; resolved after dedup
+                                let cat = products.get(f[5]).unwrap_or(unknown_cat) as u32;
+                                e.pc = p | cat << 24;
+                                e.t = (t - ws) as u32;
+                                e.person = ids.key(f[1]);
                             }
                         }
                         bk[bucket(eid, nbe)].push(e);
@@ -467,16 +483,16 @@ fn main() {
             const AHEAD: usize = 16;
             for (w, part) in parts.iter().enumerate() {
                 for i in 0..part.len() {
-                    if i + AHEAD < part.len() && part[i + AHEAD].ok {
+                    if i + AHEAD < part.len() && part[i + AHEAD].ok() {
                         person_of.prefetch(part[i + AHEAD].person);
                     }
                     let e = &part[i];
                     let g = base[w] + i;
-                    if !e.ok || dead[g / 64] >> (g % 64) & 1 == 1 {
+                    if !e.ok() || dead[g / 64] >> (g % 64) & 1 == 1 {
                         continue;
                     }
                     let p = person(e.person);
-                    st.out[bucket(p, nb)].push(PEv { person: p, ts: e.ts, price: e.price, cat: e.cat, kind: e.kind });
+                    st.out[bucket(p, nb)].push(PEv { person: p, t: e.t, pc: e.pc });
                 }
             }
         },
@@ -513,7 +529,7 @@ fn main() {
             acc += c;
         }
         ev_off.push(acc);
-        let mut ev: Vec<PEv> = vec![PEv { person: 0, ts: 0, price: 0, cat: 0, kind: 0 }; n];
+        let mut ev: Vec<PEv> = vec![PEv { person: 0, t: 0, pc: 0 }; n];
         {
             let mut fill: Vec<u32> = ev_off[..m].to_vec();
             let mut k = 0;
@@ -529,7 +545,7 @@ fn main() {
         for q in 0..m {
             let r = &mut ev[ev_off[q] as usize..ev_off[q + 1] as usize];
             if r.len() > 1 {
-                r.sort_unstable_by_key(|e| e.ts);
+                r.sort_unstable_by_key(|e| e.t);
             }
         }
         // Clicks of persons with events, grouped the same way, each group by (ts, click_id).
@@ -583,21 +599,22 @@ fn main() {
             let mut cur: Option<UserRow> = None;
             let mut j = i;
             while j < e_end {
-                let start = ev[j].ts;
+                let start = ws + ev[j].t as i64;
                 let day = start.div_euclid(DAY);
                 if cur.as_ref().is_some_and(|u| u.day as i64 != day) {
                     users.push(finish(cur.take().unwrap(), &mut catrev));
                 }
                 let mut last = start;
                 let (mut n, mut rev, mut purch) = (0u64, 0u64, false);
-                while j < e_end && ev[j].ts - last <= GAP {
+                while j < e_end && ws + ev[j].t as i64 - last <= GAP {
                     let e = ev[j];
-                    last = e.ts;
+                    last = ws + e.t as i64;
                     n += 1;
-                    if e.kind == PURCHASE {
-                        rev += e.price as u64;
+                    let pr = e.pc & PRICE_MASK;
+                    if pr != 0 {
+                        rev += pr as u64;
                         purch = true;
-                        catrev[e.cat as usize] += e.price as u64;
+                        catrev[(e.pc >> 24) as usize] += pr as u64;
                     }
                     j += 1;
                 }

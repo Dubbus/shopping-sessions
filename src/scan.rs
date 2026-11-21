@@ -21,24 +21,29 @@ fn specials(w: u64) -> u64 {
         | zero_bytes(w ^ (ONES * b'"' as u64))
 }
 
-/// Per 64-byte block: (separators = ',' | '\n', newlines, quotes), bit i = byte i.
+/// Per 64-byte block: (separators = ',' | '\n', unused 0, quotes), bit i = byte i.
 #[cfg_attr(feature = "prof", inline(never))]
 #[cfg_attr(not(feature = "prof"), inline(always))]
 fn block_masks(b: &[u8; 64]) -> (u64, u64, u64) {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     unsafe {
         use std::arch::x86_64::*;
+        // Opaque: without this LLVM rewrites movemask results as <32 x i1> vectors and
+        // rebuilds them bit by bit with ~64 vpinsrb per block (5x slower than NEON).
+        #[inline(always)]
+        fn opaque(mut x: u32) -> u32 {
+            unsafe { std::arch::asm!("/* {0:e} */", inout(reg) x, options(pure, nomem, nostack, preserves_flags)) };
+            x
+        }
         let (c, n, q) = (_mm256_set1_epi8(b',' as i8), _mm256_set1_epi8(b'\n' as i8), _mm256_set1_epi8(b'"' as i8));
-        let half = |p: *const u8| -> (u64, u64, u64) {
-            let v = _mm256_loadu_si256(p as *const __m256i);
-            let mc = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, c)) as u32 as u64;
-            let mn = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, n)) as u32 as u64;
-            let mq = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, q)) as u32 as u64;
-            (mc | mn, mn, mq)
-        };
-        let (s0, n0, q0) = half(b.as_ptr());
-        let (s1, n1, q1) = half(b.as_ptr().add(32));
-        return (s0 | s1 << 32, n0 | n1 << 32, q0 | q1 << 32);
+        let p = b.as_ptr();
+        let v0 = _mm256_loadu_si256(p as *const __m256i);
+        let v1 = _mm256_loadu_si256(p.add(32) as *const __m256i);
+        let s0 = opaque(_mm256_movemask_epi8(_mm256_or_si256(_mm256_cmpeq_epi8(v0, c), _mm256_cmpeq_epi8(v0, n))) as u32);
+        let s1 = opaque(_mm256_movemask_epi8(_mm256_or_si256(_mm256_cmpeq_epi8(v1, c), _mm256_cmpeq_epi8(v1, n))) as u32);
+        let q0 = opaque(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, q)) as u32);
+        let q1 = opaque(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, q)) as u32);
+        return (s0 as u64 | (s1 as u64) << 32, 0, q0 as u64 | (q1 as u64) << 32);
     }
     #[cfg(target_arch = "aarch64")]
     unsafe {
@@ -54,14 +59,14 @@ fn block_masks(b: &[u8; 64]) -> (u64, u64, u64) {
         let v = [vld1q_u8(b.as_ptr()), vld1q_u8(b.as_ptr().add(16)), vld1q_u8(b.as_ptr().add(32)), vld1q_u8(b.as_ptr().add(48))];
         let eq = |x: u8| { let d = vdupq_n_u8(x); [vceqq_u8(v[0], d), vceqq_u8(v[1], d), vceqq_u8(v[2], d), vceqq_u8(v[3], d)] };
         let (mc, mn, mq) = (fold(eq(b',')), fold(eq(b'\n')), fold(eq(b'"')));
-        return (mc | mn, mn, mq);
+        return (mc | mn, 0, mq);
     }
     #[allow(unreachable_code)]
     {
         let (mut sep, mut nl, mut qt) = (0u64, 0u64, 0u64);
         for (i, &c) in b.iter().enumerate() {
             sep |= ((c == b',' || c == b'\n') as u64) << i;
-            nl |= ((c == b'\n') as u64) << i;
+            let _ = &mut nl;
             qt |= ((c == b'"') as u64) << i;
         }
         (sep, nl, qt)
@@ -198,7 +203,7 @@ mod tests {
                 *b = b"a,\"\n\rz"[(s2 >> 33) as usize % 6];
             }
             let bit = |p: &dyn Fn(u8) -> bool| blk.iter().enumerate().fold(0u64, |m, (i, &c)| m | ((p(c) as u64) << i));
-            let want = (bit(&|c| c == b',' || c == b'\n'), bit(&|c| c == b'\n'), bit(&|c| c == b'"'));
+            let want = (bit(&|c| c == b',' || c == b'\n'), 0, bit(&|c| c == b'"'));
             assert_eq!(block_masks(&blk), want);
         }
         // random fuzz over a tiny alphabet

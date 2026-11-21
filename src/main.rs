@@ -291,6 +291,10 @@ fn main() {
     let organic = ncamp; // index of the organic pseudo-campaign
 
     let ids = Interner::default();
+    if let Some(path) = std::env::var_os("FIELDBENCH") {
+        field_bench(Path::new(&path), &ids, &products, unknown_cat, ws, we, ws_s);
+        return;
+    }
 
     // Links run as the first task of the parse stage, in parallel with event parsing:
     // events keep raw user IDs until dedup, clicks until after parsing.
@@ -894,6 +898,41 @@ fn write_users(path: &Path, users: &[UserRow], ids: &Interner, cats: &[Vec<u8>])
             Column { name: "top_category", data: top },
         ],
     )
+}
+
+/// Per-operation cost of event field handling on one 512 KiB chunk (benchmarking only).
+fn field_bench(path: &Path, ids: &Interner, products: &Lookup<u16>, unknown_cat: u16, ws: i64, we: i64, ws_s: i64) {
+    let mut data = std::fs::read(path).unwrap();
+    let n = data.len().min(512 << 10);
+    let cut = data[..n].iter().rposition(|&c| c == b'\n').unwrap() + 1;
+    data.truncate(cut);
+    let body_at = data.iter().position(|&c| c == b'\n').unwrap() + 1;
+    data.extend_from_slice(&[0u8; 64]);
+    let chunk = &data[body_at..cut];
+    let ctx = EvCtx { ids, products, unknown_cat, ws, we, ws_s };
+    let mut lines = 0usize;
+    scan::for_each::<7, _>(chunk, |_| lines += 1);
+    let reps = 300;
+    macro_rules! time {
+        ($name:expr, $body:expr) => {{
+            let t = Instant::now();
+            let mut acc = 0u64;
+            for _ in 0..reps {
+                scan::for_each::<7, _>(std::hint::black_box(chunk), |f| {
+                    acc = acc.wrapping_add($body(f));
+                });
+            }
+            let ns = t.elapsed().as_nanos() as f64 / (reps * lines) as f64;
+            eprintln!("{:<14} {:6.1} ns/line  ({acc})", $name, ns);
+        }};
+    }
+    time!("scan only", |f: &scan::Line| f[0].len() as u64);
+    time!("ts", |f: &scan::Line| ts::parse(&f[2]).unwrap_or(0) as u64);
+    time!("ingest", |f: &scan::Line| ts::parse(&f[3]).unwrap_or(0) as u64);
+    time!("eid key", |f: &scan::Line| unsafe { ids.key_padded(&f[0]) });
+    time!("uid key", |f: &scan::Line| unsafe { ids.key_padded(&f[1]) });
+    time!("product", |f: &scan::Line| unsafe { products.get_padded(&f[5]) }.unwrap_or(0) as u64);
+    time!("event_rec", |f: &scan::Line| { let e = event_rec(f, &ctx); e.eid ^ e.pc as u64 });
 }
 
 struct EvCtx<'a> {

@@ -43,3 +43,4 @@ Container on ss-bench (Cascade Lake, scorer flags, 20M): 1.33-1.35 s median. 60M
 - 07:44 verify on 85dd944: 169/172 (3 known), dev MATCH, 20m MATCH. Container (5 runs): median 1.383 s (rig drifting up through the night: 1.319 -> 1.383 on near-identical code).
 - 08:00 queue 5, partitions (4 rounds, 20M, total ms): default (event 10 bits) 1145-1152 (+1 outlier); event 9: 1134-1149, every round better (parse -12 ms); event 11: 1158-1296; person 8: 1156-1180; person 10: 1155-1170. 60M: event 12 (default) 3.67-3.94 s vs 11: 3.53-3.62 s.
 - 08:05 kept: event partitions sized for 64k events (rule, so it scales: 9 bits at 20M, 11 at 60M). Verified, committed 2f45fb1, pushed.
+- 08:07 sweep 3 (seeds 300-339 on 85dd944): 40/40 agree. Sweep 4 started on 2f45fb1 (seeds 400-429, ~/sweep4.log).

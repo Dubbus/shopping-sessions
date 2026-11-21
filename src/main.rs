@@ -419,6 +419,7 @@ fn main() {
         multi: Vec<u64>,
         out: Vec<Vec<PEv>>,
         ck: Vec<Vec<Ck>>,
+        times: [u64; 3],
     }
     let deduped = workers(
         threads + nbe,
@@ -430,6 +431,7 @@ fn main() {
             multi: Vec::new(),
             out: (0..nb).map(|_| Vec::with_capacity(pev_cap)).collect(),
             ck: (0..nb).map(|_| Vec::new()).collect(),
+            times: [0; 3],
         },
         |st, b| {
             if b < threads {
@@ -450,6 +452,7 @@ fn main() {
                 return;
             }
             let b = b - threads;
+            let tt = Instant::now();
             let parts: Vec<&[Ev]> = parsed.iter().map(|p| &p.ev[b][..]).collect();
             let n: usize = parts.iter().map(|p| p.len()).sum();
             // Pass 1: two cache-sized bitmaps over a hash of event_id find every event whose
@@ -471,6 +474,7 @@ fn main() {
                     seen[w] |= m;
                 }
             }
+            let t1 = tt.elapsed().as_nanos() as u64;
             // Pass 2 (candidates only): exact dedup, smallest ingest_ts wins; losers marked dead.
             let dead = &mut st.dead;
             dead.clear();
@@ -498,6 +502,7 @@ fn main() {
                     g += 1;
                 }
             }
+            let t2 = tt.elapsed().as_nanos() as u64;
             let mut base = Vec::with_capacity(parts.len());
             let mut acc = 0usize;
             for p in &parts {
@@ -524,8 +529,21 @@ fn main() {
                     st.out[bucket(p, nb)].push(PEv { person: p, t: e.t, pc: e.pc });
                 }
             }
+            let t3 = tt.elapsed().as_nanos() as u64;
+            st.times[0] += t1;
+            st.times[1] += t2 - t1;
+            st.times[2] += t3 - t2;
         },
     );
+    if std::env::var_os("STAGE_T").is_some() {
+        let mut t = [0u64; 3];
+        for d in &deduped {
+            for k in 0..3 {
+                t[k] += d.times[k];
+            }
+        }
+        eprintln!("dedup thread-ms: bitmaps {} candidates {} emit {}", t[0] / 1_000_000, t[1] / 1_000_000, t[2] / 1_000_000);
+    }
     lap("dedup");
 
     // ---- sessions, credit, assists per person bucket ----

@@ -788,7 +788,7 @@ fn main() -> Res<()> {
                     let top = categories
                         .iter()
                         .max_by(|a, b| a.1.cmp(&b.1).then_with(|| category_rank[b.0 as usize].cmp(&category_rank[a.0 as usize])))
-                        .map(|&(c, _)| category_names[c as usize]);
+                        .map_or(output::NO_CATEGORY, |&(c, _)| c);
                     categories.clear();
                     s.rows.user_id.push(s.names[person]);
                     s.rows.day.push(day as i32);
@@ -906,8 +906,7 @@ fn main() -> Res<()> {
             if total[0] == 0 && total[3] == 0 {
                 continue;
             }
-            campaign_rows.campaign_id.push(campaign_names[campaign]);
-            campaign_rows.channel.push(channels[campaign]);
+            campaign_rows.campaign.push(campaign as u32);
             campaign_rows.day.push((first_day + day as i64) as i32);
             campaign_rows.sessions.push(total[0] as i64);
             campaign_rows.purchasing_sessions.push(total[1] as i64);
@@ -922,10 +921,10 @@ fn main() -> Res<()> {
         |_| Vec::<Res<()>>::new(),
         |results, i| {
             if i == sessions.len() {
-                results.push(output::write_campaign_daily(&campaign_dir.join("part-000.parquet"), &campaign_rows));
+                results.push(output::write_campaign_daily(&campaign_dir.join("part-000.parquet"), &campaign_rows, &campaign_names, &channels));
             } else if i == 0 || !sessions[i].rows.user_id.is_empty() {
                 // The first file is written even when empty, so the table always exists.
-                results.push(output::write_user_daily(&user_dir.join(format!("part-{i:03}.parquet")), &sessions[i].rows));
+                results.push(output::write_user_daily(&user_dir.join(format!("part-{i:03}.parquet")), &sessions[i].rows, &category_names));
             }
         },
     );

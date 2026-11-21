@@ -12,8 +12,8 @@ Container on ss-bench (Cascade Lake, scorer flags, 20M): 1.33-1.35 s median. 60M
 
 1. ~~Dedup bitmap size: `count * 8` bits now; try 4 and 16 (knob) - fewer L1 misses vs more candidates.~~ No win (see log).
 2. ~~Thread count: NCPU 7 / 8 / 9 / 10 on ss-bench (oversubscription can hide stalls).~~ 8 is best.
-3. Block reuse: survivors' scatter takes blocks freed by dedup (already faulted pages) instead of
-   new huge pages - kernel page zeroing is ~5.7% of samples.
+3. ~~Block reuse: survivors' scatter takes blocks freed by dedup (already faulted pages) instead of
+   new huge pages - kernel page zeroing is ~5.7% of samples.~~ Kept (85dd944).
 4. Chunk size with mmap reads: SS_CHUNK_KB 256 / 512 / 1024 / 2048 (fault-around and scheduling).
 5. Event partition count (event_bits) +-1 and person partition count +-1 with mmap reads in place.
 
@@ -28,3 +28,9 @@ Container on ss-bench (Cascade Lake, scorer flags, 20M): 1.33-1.35 s median. 60M
 - 04:50 container (5 runs): median 1.340 s (min 1.337); rig drift vs 03:50 (1.319).
 - 05:00 queue 2, threads (4 rounds, total ms): NCPU=8 1134-1138; 7 1181-1190; 9 1137-1152; 10 1144-1170; 12 1158-1192. 8 stays.
 - 05:00 sweep 2 (seeds 200-239, 300k, vs both references): 40/40 agree. 80/80 seeds overall tonight.
+- 05:41 merge: no new clean-slate commits.
+- 05:44 verify: 169/172 (3 known), dev MATCH, 20m MATCH. Container (5 runs): median 1.351 s.
+- 06:05 queue 3, block reuse (SS_REUSE), 5 rounds at 20M: dedup 204 -> 196 ms, total 1143 -> 1127 ms (-1.4%), every reuse run faster. Made default (SS_NO_REUSE=1 turns it off), verified, committed 85dd944, pushed.
+- 06:10 container after 85dd944 (5 runs): median 1.367 s - rig drift between back-to-back batches; the interleaved native A/B is the reliable signal.
+- 06:20 60M check with reuse: output MATCHES master; peak RSS ~11.1 GB with or without reuse (mapped input counted). One 12.4 s run was a cold page cache (60M files partly evicted); warm, 4 rounds: reuse 3.57-3.62 s vs no reuse 3.59-3.77 s, dedup 652 vs 663 ms - neutral to slightly better.
+- 06:20 sweep 2 still 40/40 (done).

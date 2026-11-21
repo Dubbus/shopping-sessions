@@ -39,10 +39,17 @@ impl Arena {
     }
 }
 
+/// Benchmarking only: plain stores instead of non-temporal ones.
+pub static PLAIN_STORES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Copies `lines` 64-byte lines from `from` to the 64-byte-aligned `to`, bypassing the cache.
 #[inline]
 unsafe fn stream(from: *const u8, to: *mut u8, lines: usize) {
     unsafe {
+        if PLAIN_STORES.load(std::sync::atomic::Ordering::Relaxed) {
+            std::ptr::copy_nonoverlapping(from, to, lines * 64);
+            return;
+        }
         #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
         {
             use std::arch::x86_64::*;

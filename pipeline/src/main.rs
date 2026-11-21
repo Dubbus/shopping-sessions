@@ -109,6 +109,8 @@ fn click_id(key: u128) -> Id {
 
 /// Everything the parse stage reads but never changes.
 struct Ctx {
+    ablate: u64,
+    skip: u64,
     window_start: i64,
     window_end: i64,
     /// `window_start` minus 7 days: the zero of every stored timestamp.
@@ -193,9 +195,10 @@ fn parse_event(&[id, user, ts, ingest, kind, product, price]: &[&[u8]; 7], ctx: 
         return;
     }
     // The rules promise a valid F1 ingest_ts; a copy without one cannot be ordered, so it is dropped.
-    let Some(ingest) = out.dates.parse_f1_secs(ingest) else { return };
+    let ingest = if ctx.skip & 1 != 0 { Some(1_700_000_000 + ingest.len() as i64) } else { out.dates.parse_f1_secs(ingest) };
+    let Some(ingest) = ingest else { return };
     let mut event = Event {
-        id: unsafe { key::id(id) },
+        id: if ctx.skip & 2 != 0 { id.as_ptr() as u64 } else { unsafe { key::id(id) } },
         user: 0,
         ingest_price: ((ingest + YEAR_ZERO) as u64) << 24,
         ts: 0,
@@ -206,7 +209,8 @@ fn parse_event(&[id, user, ts, ingest, kind, product, price]: &[&[u8]; 7], ctx: 
         if user.is_empty() || product.is_empty() {
             break 'valid;
         }
-        let Some(t) = out.dates.parse(ts) else { break 'valid };
+        let t = if ctx.skip & 4 != 0 { Some(ctx.window_start + ts.len() as i64) } else { out.dates.parse(ts) };
+        let Some(t) = t else { break 'valid };
         if t < ctx.window_start || t >= ctx.window_end || ingest * 1000 - t > DAY_MS {
             break 'valid;
         }
@@ -225,11 +229,15 @@ fn parse_event(&[id, user, ts, ingest, kind, product, price]: &[&[u8]; 7], ctx: 
             break 'valid;
         };
         event.ts = (t - ctx.base) as u32;
-        event.user = unsafe { key::id(user) };
+        event.user = if ctx.skip & 2 != 0 { user.as_ptr() as u64 } else { unsafe { key::id(user) } };
         event.ingest_price |= cents as u64;
         event.category |= VALID;
     }
     // An invalid copy travels on too: it can be the one dedup keeps.
+    if ctx.skip & 16 != 0 {
+        std::hint::black_box(&event);
+        return;
+    }
     out.events.push(partition(key::hash(event.id), ctx.event_bits), event);
 }
 
@@ -547,7 +555,13 @@ fn main() -> Res<()> {
     let link_chunks = chunks.iter().filter(|c| c.0 == Kind::Links).count();
     let links_read = AtomicUsize::new(0);
     let all_links: Mutex<Vec<(Id, Id)>> = Mutex::new(Vec::new());
-    let ctx = Ctx { window_start, window_end, base, products, unknown_category, campaigns, renames: OnceLock::new(), event_bits, person_bits };
+    // Benchmarking only. SS_ABLATE: events 1 = read only, 2 = + index, 3 = + cut fields,
+    // 9 = full parse; the run stops after parse. SS_SKIP bits: 1 ingest_ts, 2 IDs, 4 ts,
+    // 16 the partition push, 32 (with SS_ABLATE) clicks.
+    let (ablate, skip) = (knob("SS_ABLATE").unwrap_or(0), knob("SS_SKIP").unwrap_or(0));
+    scan::PORTABLE.store(knob("SS_NO512").is_some(), Ordering::Relaxed);
+    scatter::PLAIN_STORES.store(knob("SS_PLAIN_STORES").is_some(), Ordering::Relaxed);
+    let ctx = Ctx { ablate, skip, window_start, window_end, base, products, unknown_category, campaigns, renames: OnceLock::new(), event_bits, person_bits };
     let parsed = par::run(
         threads,
         chunks.len() + 1,
@@ -575,7 +589,18 @@ fn main() -> Res<()> {
             let (len, first) = io::load_chunk(&files[file].0, files[file].1, start, end, &mut buf).expect("read failed");
             let last = first + (end - start) as usize;
             let mut index = std::mem::take(&mut out.index);
+            if ctx.ablate == 1 && matches!(kind, Kind::Events) {
+                std::hint::black_box(&buf);
+                out.buf = buf;
+                out.index = index;
+                return;
+            }
             index.build(&buf, len);
+            if ctx.ablate == 2 && matches!(kind, Kind::Events) {
+                out.buf = buf;
+                out.index = index;
+                return;
+            }
             match kind {
                 Kind::Links => {
                     let links = &mut out.links;
@@ -583,7 +608,11 @@ fn main() -> Res<()> {
                     all_links.lock().unwrap().append(links);
                     links_read.fetch_add(1, Ordering::Release);
                 }
+                Kind::Events if ctx.ablate == 3 => index.for_each_record(&buf, first, last, |fields: &[&[u8]; 7]| {
+                    std::hint::black_box(fields);
+                }),
                 Kind::Events => index.for_each_record(&buf, first, last, |fields| parse_event(fields, &ctx, out)),
+                Kind::Clicks if ctx.ablate != 0 && ctx.skip & 32 != 0 => {}
                 Kind::Clicks => {
                     let renames = loop {
                         match ctx.renames.get() {
@@ -604,6 +633,9 @@ fn main() -> Res<()> {
     let (events, clicks): (Vec<Scattered<Event>>, Vec<Scattered<Click>>) =
         parsed.into_iter().map(|thread| (thread.events.finish(), thread.clicks.finish())).unzip();
     log("parse");
+    if ablate != 0 {
+        std::process::exit(0);
+    }
 
     // ---- 2. Dedup events; scatter survivors by person ---------------------------------------
     /// How many survivors wait for their rename-table slot to arrive in cache.

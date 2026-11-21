@@ -9,6 +9,9 @@
 /// Bytes that must be readable after the data handed to [`Index::build`].
 pub const SLACK: usize = 128;
 
+/// Benchmarking only: use the portable index builder even where AVX-512 is available.
+pub static PORTABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 #[derive(Default)]
 pub struct Index {
     /// Positions of commas, then sentinels.
@@ -38,7 +41,7 @@ impl Index {
         // SAFETY: the capacities above cover every write the builders make.
         unsafe {
             #[cfg(target_arch = "x86_64")]
-            if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
+            if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") && !PORTABLE.load(std::sync::atomic::Ordering::Relaxed) {
                 self.build_avx512(buf.as_ptr(), len);
             } else {
                 self.build_portable(buf.as_ptr(), len);

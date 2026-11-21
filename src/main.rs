@@ -437,6 +437,9 @@ fn main() {
                 let raw = &parsed[b].ck;
                 const AHEAD: usize = 16;
                 for i in 0..raw.len() {
+                    if let Some(x) = raw.get(i + 2 * AHEAD) {
+                        person_of.prefetch_filter(x.person);
+                    }
                     if i + AHEAD < raw.len() {
                         person_of.prefetch(raw[i + AHEAD].person);
                     }
@@ -504,6 +507,11 @@ fn main() {
             const AHEAD: usize = 16;
             for (w, part) in parts.iter().enumerate() {
                 for i in 0..part.len() {
+                    if let Some(x) = part.get(i + 2 * AHEAD)
+                        && x.ok()
+                    {
+                        person_of.prefetch_filter(x.person);
+                    }
                     if i + AHEAD < part.len() && part[i + AHEAD].ok() {
                         person_of.prefetch(part[i + AHEAD].person);
                     }
@@ -795,6 +803,12 @@ impl Persons {
     fn get(&self, k: u64) -> Option<u64> {
         if self.may_have(k) { self.table.get(k) } else { None }
     }
+    /// Stage 1 of a two-stage prefetch: bring in the filter word.
+    #[inline(always)]
+    fn prefetch_filter(&self, k: u64) {
+        prefetch_read(&self.filter[self.fbit(k) / 64]);
+    }
+    /// Stage 2: the filter word should be cached by now; prefetch the table slot if needed.
     #[inline(always)]
     fn prefetch(&self, k: u64) {
         if self.may_have(k) {

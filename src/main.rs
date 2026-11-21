@@ -949,6 +949,18 @@ fn field_bench(path: &Path, ids: &Interner, products: &Lookup<u16>, unknown_cat:
     time!("event_rec", |f: &scan::Line| { let e = event_rec(f, &ctx); e.eid ^ e.pc as u64 });
 }
 
+#[inline(always)]
+fn prefetch_read<T>(p: &T) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(p as *const T as *const i8, std::arch::x86_64::_MM_HINT_T0)
+    };
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p as *const T, options(nostack, readonly, preserves_flags))
+    };
+}
+
 struct EvCtx<'a> {
     ids: &'a Interner,
     products: &'a Lookup<u16>,

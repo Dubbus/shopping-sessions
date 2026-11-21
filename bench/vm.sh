@@ -5,7 +5,7 @@
 set -eu
 NAME=${NAME:-ss-bench}
 ZONE=${ZONE:-us-central1-a}
-TYPE=${TYPE:-n2-standard-16}
+TYPE=${TYPE:-n2-standard-8}  # new-account quota is 12 vCPUs
 here=$(cd "$(dirname "$0")" && pwd)
 ssh_() { gcloud compute ssh "$NAME" --zone "$ZONE" --quiet --command "$1"; }
 case "${1:-}" in
@@ -21,6 +21,7 @@ setup)
   gcloud compute scp --zone "$ZONE" --quiet "$here/remote_setup.sh" "$here/remote_bench.sh" /tmp/ss-gen.tgz /tmp/ss-ans.tgz "$NAME":
   ssh_ "bash remote_setup.sh" ;;
 bench) ssh_ "bash remote_bench.sh ${2:-5} ${COMMIT:-}" ;;
+native) ssh_ "BENCH_ENV=\"${BENCH_ENV:-}\" bash remote_bench.sh native ${COMMIT:-}" ;;
 perf)  ssh_ "bash remote_bench.sh perf ${COMMIT:-}" ;;
 ssh)   gcloud compute ssh "$NAME" --zone "$ZONE" ;;
 stop)  gcloud compute instances stop "$NAME" --zone "$ZONE" ;;

@@ -224,7 +224,8 @@ fn json_ts(s: &str, key: &str) -> i64 {
     ts::parse(rest[a..b].as_bytes()).expect("manifest ts")
 }
 
-#[inline]
+#[cfg_attr(feature = "prof", inline(never))]
+#[cfg_attr(not(feature = "prof"), inline(always))]
 fn price(s: &[u8]) -> Option<u32> {
     if s.is_empty() {
         return None;
@@ -277,6 +278,7 @@ fn main() {
     for (p, c) in &prod_raw {
         products.insert(p, cat_index[&c[..]]);
     }
+    products.finish();
     let ncats = cat_names.len();
 
     let mut camp_ids: Vec<Vec<u8>> = Vec::new();
@@ -291,6 +293,7 @@ fn main() {
             camp_channels.push(f[1].to_vec());
         }
     }
+    campaigns.finish();
     let ncamp = camp_ids.len();
     let organic = ncamp; // index of the organic pseudo-campaign
 
@@ -452,6 +455,7 @@ fn main() {
     let pev_cap = (ev_bytes / 70 / (threads * nb) as u64) as usize * 11 / 10 + 64;
     struct DedupState {
         best: Table,
+        dead: Vec<u64>,
         out: Vec<Vec<PEv>>,
     }
     let deduped = workers(
@@ -459,6 +463,7 @@ fn main() {
         threads,
         || DedupState {
             best: Table::with_capacity(8),
+            dead: Vec::new(),
             out: (0..nb).map(|_| Vec::with_capacity(pev_cap)).collect(),
         },
         |st, b| {
@@ -466,13 +471,33 @@ fn main() {
             let n: usize = parts.iter().map(|p| p.len()).sum();
             let best = &mut st.best;
             best.reset(n);
-            let at = |r: u64| -> &Ev { &parts[(r >> 32) as usize][(r & 0xffff_ffff) as usize] };
+            // One probe per event: when two copies meet, the loser is marked dead.
+            let dead = &mut st.dead;
+            dead.clear();
+            dead.resize(n.div_ceil(64), 0);
+            let mut base = Vec::with_capacity(parts.len());
+            let mut acc = 0usize;
+            for p in &parts {
+                base.push(acc);
+                acc += p.len();
+            }
+            let ev_at = |g: usize| -> &Ev {
+                let w = base.partition_point(|&b| b <= g) - 1;
+                &parts[w][g - base[w]]
+            };
             for (w, part) in parts.iter().enumerate() {
                 for (i, e) in part.iter().enumerate() {
-                    let r = ((w as u64) << 32) | i as u64;
-                    let (slot, new) = best.entry(e.eid, r);
-                    if !new && at(*slot).ingest > e.ingest {
-                        *slot = r;
+                    let g = base[w] + i;
+                    let (slot, new) = best.entry(e.eid, g as u64);
+                    if !new {
+                        let old = *slot as usize;
+                        let loser = if ev_at(old).ingest > e.ingest {
+                            *slot = g as u64;
+                            old
+                        } else {
+                            g
+                        };
+                        dead[loser / 64] |= 1 << (loser % 64);
                     }
                 }
             }
@@ -483,7 +508,8 @@ fn main() {
                         person_of.prefetch(part[i + AHEAD].person);
                     }
                     let e = &part[i];
-                    if !e.ok || best.get(e.eid) != Some(((w as u64) << 32) | i as u64) {
+                    let g = base[w] + i;
+                    if !e.ok || dead[g / 64] >> (g % 64) & 1 == 1 {
                         continue;
                     }
                     let p = person(e.person);

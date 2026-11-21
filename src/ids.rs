@@ -9,7 +9,8 @@ use std::sync::{Mutex, RwLock};
 
 pub const FALLBACK: u64 = 1 << 63;
 
-#[inline]
+#[cfg_attr(feature = "prof", inline(never))]
+#[cfg_attr(not(feature = "prof"), inline(always))]
 pub fn pack(b: &[u8]) -> Option<u64> {
     if b.len() > 9 {
         return None;
@@ -87,20 +88,65 @@ impl Interner {
 pub struct Lookup<V: Copy> {
     packed: FxMap<u64, V>,
     other: FxMap<Vec<u8>, V>,
+    /// When every key is `prefix` + a canonical decimal (like `p123`, `c_45`), an array
+    /// indexed by the number. Exact: a query of any other shape can match no key.
+    dense: Option<(Vec<u8>, Vec<Option<V>>)>,
+    keys: Vec<Vec<u8>>,
+}
+
+fn canonical_number(rest: &[u8]) -> Option<usize> {
+    if rest.is_empty() || rest.len() > 7 || (rest[0] == b'0' && rest.len() > 1) {
+        return None;
+    }
+    let mut v = 0usize;
+    for &c in rest {
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        v = v * 10 + (c - b'0') as usize;
+    }
+    Some(v)
 }
 
 impl<V: Copy> Lookup<V> {
     pub fn new() -> Self {
-        Self { packed: FxMap::default(), other: FxMap::default() }
+        Self { packed: FxMap::default(), other: FxMap::default(), dense: None, keys: Vec::new() }
+    }
+
+    /// Call after the last insert: switches to the dense array when the keys allow it.
+    pub fn finish(&mut self) {
+        let Some(first) = self.keys.first() else { return };
+        let plen = first.iter().position(|c| c.is_ascii_digit()).unwrap_or(first.len());
+        let prefix = first[..plen].to_vec();
+        let mut nums = Vec::with_capacity(self.keys.len());
+        for k in &self.keys {
+            match k.strip_prefix(&prefix[..]).and_then(canonical_number) {
+                Some(n) => nums.push(n),
+                None => return,
+            }
+        }
+        let mut table = vec![None; nums.iter().max().unwrap() + 1];
+        for (k, n) in self.keys.iter().zip(nums) {
+            table[n] = self.get(k);
+        }
+        self.dense = Some((prefix, table));
     }
     pub fn insert(&mut self, b: &[u8], v: V) {
+        self.keys.push(b.to_vec());
         match pack(b) {
             Some(k) => self.packed.insert(k, v),
             None => self.other.insert(b.to_vec(), v),
         };
     }
-    #[inline]
+#[cfg_attr(feature = "prof", inline(never))]
+#[cfg_attr(not(feature = "prof"), inline(always))]
     pub fn get(&self, b: &[u8]) -> Option<V> {
+        if let Some((prefix, table)) = &self.dense {
+            return match b.strip_prefix(&prefix[..]).and_then(canonical_number) {
+                Some(n) => table.get(n).copied().flatten(),
+                None => None,
+            };
+        }
         match pack(b) {
             Some(k) => self.packed.get(&k).copied(),
             None => self.other.get(b).copied(),
@@ -123,6 +169,26 @@ mod tests {
             assert_eq!(&v[..], *a);
         }
         assert!(pack(b"u123456789").is_none());
+    }
+
+    #[test]
+    fn dense_lookup_is_exact() {
+        let mut l: Lookup<u32> = Lookup::new();
+        for (i, k) in ["c_1", "c_2", "c_10", "c_0"].iter().enumerate() {
+            l.insert(k.as_bytes(), i as u32);
+        }
+        l.finish();
+        assert!(l.dense.is_some());
+        for (q, want) in [("c_1", Some(0)), ("c_10", Some(2)), ("c_0", Some(3)), ("c_01", None), ("C_1", None),
+                          ("c_3", None), ("c_99999999", None), (" c_1", None), ("c_1 ", None), ("c_", None), ("", None)] {
+            assert_eq!(l.get(q.as_bytes()), want, "{q}");
+        }
+        let mut l: Lookup<u32> = Lookup::new();
+        l.insert(b"p1", 1);
+        l.insert(b"x7", 2);
+        l.finish();
+        assert!(l.dense.is_none());
+        assert_eq!(l.get(b"x7"), Some(2));
     }
 }
 

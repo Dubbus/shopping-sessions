@@ -45,11 +45,17 @@ impl Table {
             use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
             _mm_prefetch(self.slots.as_ptr().add(self.slot(k)) as *const i8, _MM_HINT_T0);
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            let p = self.slots.as_ptr().add(self.slot(k));
+            std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, readonly, preserves_flags));
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         let _ = k;
     }
 
-    #[inline(always)]
+#[cfg_attr(feature = "prof", inline(never))]
+#[cfg_attr(not(feature = "prof"), inline(always))]
     pub fn get(&self, k: u64) -> Option<u64> {
         let mask = self.slots.len() - 1;
         let mut i = self.slot(k);
@@ -66,7 +72,8 @@ impl Table {
     }
 
     /// Insert or return the existing value's slot index for in-place update.
-    #[inline(always)]
+#[cfg_attr(feature = "prof", inline(never))]
+#[cfg_attr(not(feature = "prof"), inline(always))]
     pub fn entry(&mut self, k: u64, v: u64) -> (&mut u64, bool) {
         if self.len * 2 >= self.slots.len() {
             self.grow();

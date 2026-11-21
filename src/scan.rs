@@ -22,7 +22,8 @@ fn specials(w: u64) -> u64 {
 }
 
 /// Bit i set iff byte i of the 64-byte block is ',', '"' or '\n'.
-#[inline(always)]
+#[cfg_attr(feature = "prof", inline(never))]
+#[cfg_attr(not(feature = "prof"), inline(always))]
 fn block_mask(b: &[u8; 64]) -> u64 {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     unsafe {

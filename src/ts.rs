@@ -25,21 +25,26 @@ fn days_in_month(y: i64, m: i64) -> i64 {
     }
 }
 
-#[inline]
-fn dig(b: u8) -> Option<i64> {
-    if b.is_ascii_digit() { Some((b - b'0') as i64) } else { None }
-}
-
-#[inline]
-fn num(s: &[u8]) -> Option<i64> {
-    let mut v = 0;
-    for &c in s {
-        v = v * 10 + dig(c)?;
+/// Days from 1970-01-01 to the first of each month, years 1900..2200 (fast path).
+const Y0: i64 = 1900;
+const NY: usize = 300;
+static MONTH_START: std::sync::LazyLock<Vec<i64>> = std::sync::LazyLock::new(|| {
+    let mut v = Vec::with_capacity(NY * 12);
+    for y in 0..NY as i64 {
+        for m in 1..=12 {
+            v.push(days_from_civil(Y0 + y, m, 1));
+        }
     }
-    Some(v)
+    v
+});
+
+#[inline(always)]
+fn d(b: u8) -> u32 {
+    b.wrapping_sub(b'0') as u32
 }
 
-#[inline]
+#[cfg_attr(feature = "prof", inline(never))]
+#[cfg_attr(not(feature = "prof"), inline(always))]
 pub fn parse(s: &[u8]) -> Option<i64> {
     match s.len() {
         20 | 25 if s[4] == b'-' => civil(s),
@@ -49,7 +54,19 @@ pub fn parse(s: &[u8]) -> Option<i64> {
 }
 
 /// F3: digits only, leading zeros fine; too big for i64 is out of every window = bad.
+#[cfg_attr(feature = "prof", inline(never))]
+#[cfg_attr(not(feature = "prof"), inline(always))]
 fn epoch_ms(s: &[u8]) -> Option<i64> {
+    if s.len() <= 18 {
+        let mut v: i64 = 0;
+        let mut bad = 0u32;
+        for &c in s {
+            let x = d(c);
+            bad |= (x > 9) as u32;
+            v = v * 10 + x as i64;
+        }
+        return if bad == 0 { Some(v) } else { None };
+    }
     let mut v: u64 = 0;
     for &c in s {
         if !c.is_ascii_digit() {
@@ -60,17 +77,25 @@ fn epoch_ms(s: &[u8]) -> Option<i64> {
     i64::try_from(v).ok()
 }
 
+#[cfg_attr(feature = "prof", inline(never))]
+#[cfg_attr(not(feature = "prof"), inline(always))]
 fn civil(s: &[u8]) -> Option<i64> {
-    if s[7] != b'-' || s[10] != b'T' || s[13] != b':' || s[16] != b':' {
+    // Fixed positions: YYYY-MM-DDTHH:MM:SS then Z or +HH:MM.
+    let dg = [d(s[0]), d(s[1]), d(s[2]), d(s[3]), d(s[5]), d(s[6]), d(s[8]), d(s[9]), d(s[11]), d(s[12]), d(s[14]), d(s[15]), d(s[17]), d(s[18])];
+    let mut bad = (s[7] != b'-') as u32 | (s[10] != b'T') as u32 | (s[13] != b':') as u32 | (s[16] != b':') as u32;
+    for x in dg {
+        bad |= (x > 9) as u32;
+    }
+    if bad != 0 {
         return None;
     }
-    let y = num(&s[0..4])?;
-    let mo = num(&s[5..7])?;
-    let d = num(&s[8..10])?;
-    let h = num(&s[11..13])?;
-    let mi = num(&s[14..16])?;
-    let se = num(&s[17..19])?;
-    if !(1..=12).contains(&mo) || d < 1 || d > days_in_month(y, mo) || h > 23 || mi > 59 || se > 59 {
+    let y = (dg[0] * 1000 + dg[1] * 100 + dg[2] * 10 + dg[3]) as i64;
+    let mo = (dg[4] * 10 + dg[5]) as i64;
+    let dd = (dg[6] * 10 + dg[7]) as i64;
+    let h = (dg[8] * 10 + dg[9]) as i64;
+    let mi = (dg[10] * 10 + dg[11]) as i64;
+    let se = (dg[12] * 10 + dg[13]) as i64;
+    if !(1..=12).contains(&mo) || dd < 1 || dd > days_in_month(y, mo) || h > 23 || mi > 59 || se > 59 {
         return None;
     }
     let offset = if s.len() == 20 {
@@ -84,17 +109,23 @@ fn civil(s: &[u8]) -> Option<i64> {
             b'-' => -1,
             _ => return None,
         };
-        if s[22] != b':' {
+        let (a, b, c, e) = (d(s[20]), d(s[21]), d(s[23]), d(s[24]));
+        if s[22] != b':' || a > 9 || b > 9 || c > 9 || e > 9 {
             return None;
         }
-        let oh = num(&s[20..22])?;
-        let om = num(&s[23..25])?;
+        let (oh, om) = ((a * 10 + b) as i64, (c * 10 + e) as i64);
         if oh > 23 || om > 59 {
             return None;
         }
         sign * (oh * HOUR + om * MIN)
     };
-    Some(days_from_civil(y, mo, d) * DAY + h * HOUR + mi * MIN + se * SEC - offset)
+    let yi = y - Y0;
+    let day0 = if (0..NY as i64).contains(&yi) {
+        MONTH_START[yi as usize * 12 + mo as usize - 1]
+    } else {
+        days_from_civil(y, mo, 1)
+    };
+    Some((day0 + dd - 1) * DAY + h * HOUR + mi * MIN + se * SEC - offset)
 }
 
 #[cfg(test)]
@@ -117,5 +148,14 @@ mod tests {
             assert_eq!(parse(bad), None, "{:?}", String::from_utf8_lossy(bad));
         }
         assert!(parse(b"2028-02-29T00:00:00Z").is_some());
+        // fast path agrees with days_from_civil across years, including outside the table
+        for (y, m, dd) in [(1899, 12, 31), (1900, 1, 1), (1970, 1, 1), (2026, 10, 3), (2028, 2, 29), (2199, 12, 31), (2200, 1, 1), (9999, 12, 31), (0, 3, 1)] {
+            let txt = format!("{y:04}-{m:02}-{dd:02}T01:02:03Z");
+            let want = super::days_from_civil(y, m, dd) * super::DAY + super::HOUR + 2 * super::MIN + 3 * super::SEC;
+            assert_eq!(parse(txt.as_bytes()), Some(want), "{txt}");
+        }
+        assert_eq!(parse(b"000000000000000000001791071890000"), Some(1791071890000));
+        assert_eq!(parse(b"9223372036854775807"), Some(i64::MAX));
+        assert_eq!(parse(b"9223372036854775808"), None);
     }
 }

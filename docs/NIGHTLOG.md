@@ -14,7 +14,7 @@ Container on ss-bench (Cascade Lake, scorer flags, 20M): 1.33-1.35 s median. 60M
 2. ~~Thread count: NCPU 7 / 8 / 9 / 10 on ss-bench (oversubscription can hide stalls).~~ 8 is best.
 3. ~~Block reuse: survivors' scatter takes blocks freed by dedup (already faulted pages) instead of
    new huge pages - kernel page zeroing is ~5.7% of samples.~~ Kept (85dd944).
-4. Chunk size with mmap reads: SS_CHUNK_KB 256 / 512 / 1024 / 2048 (fault-around and scheduling).
+4. ~~Chunk size with mmap reads: SS_CHUNK_KB 256 / 512 / 1024 / 2048 (fault-around and scheduling).~~ 512 stays.
 5. Event partition count (event_bits) +-1 and person partition count +-1 with mmap reads in place.
 
 ## Log
@@ -34,3 +34,8 @@ Container on ss-bench (Cascade Lake, scorer flags, 20M): 1.33-1.35 s median. 60M
 - 06:10 container after 85dd944 (5 runs): median 1.367 s - rig drift between back-to-back batches; the interleaved native A/B is the reliable signal.
 - 06:20 60M check with reuse: output MATCHES master; peak RSS ~11.1 GB with or without reuse (mapped input counted). One 12.4 s run was a cold page cache (60M files partly evicted); warm, 4 rounds: reuse 3.57-3.62 s vs no reuse 3.59-3.77 s, dedup 652 vs 663 ms - neutral to slightly better.
 - 06:20 sweep 2 still 40/40 (done).
+- 06:41 merge: no new clean-slate commits.
+- 06:44 verify on 85dd944: 169/172 (3 known), dev MATCH, 20m MATCH.
+- 06:50 container (5 runs): median 1.352 s (min 1.347).
+- 07:05 queue 4, chunk size with mapped reads (4 rounds, total ms): 512 1135-1145; 256 1132-1140 (parse identical, within noise); 1024 1140-1153; 2048 1165-1171. 512 stays.
+- 07:06 sweep 3 started on 85dd944 (block reuse): seeds 300-339, ~/sweep3.log.

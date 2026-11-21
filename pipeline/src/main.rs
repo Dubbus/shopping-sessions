@@ -554,7 +554,8 @@ fn main() -> Res<()> {
         }
     }
     let rough_events = (event_bytes / 64) as usize;
-    let event_bits = knob("SS_EVENT_BITS").map_or(bits_for(rough_events, 1 << 15, 12), |b| b as u32);
+    // About 64k events per partition (32k measured ~1% slower at 20M and 60M on ss-bench).
+    let event_bits = knob("SS_EVENT_BITS").map_or(bits_for(rough_events, 1 << 16, 12), |b| b as u32);
     let person_bits = knob("SS_PERSON_BITS").map_or(bits_for(rough_events, 1 << 16, 11), |b| b as u32);
     log("open");
 

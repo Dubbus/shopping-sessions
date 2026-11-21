@@ -1,23 +1,34 @@
 //! Shopping Sessions pipeline. See docs/rules.md for the rules and
-//! docs/PLAN.md for the design. Stages, each parallel across all cores:
+//! docs/PLAN.md for the design.
 //!
-//!   1. parse     every CSV chunk into compact records; intern user IDs
-//!   2. link      union-find over the link pairs; name each person
-//!   3. dedup     events by event_id (partitioned by its hash), then validate
-//!   4. sessions  per person: sort, split into sessions, credit clicks, aggregate
-//!   5. write     Parquet, one user_daily file per thread
+//! Every stage is parallel, and every lookup happens inside a partition small
+//! enough to stay in the CPU cache: records are passed from stage to stage by
+//! scattering them on the hash of whatever the next stage looks up.
+//!
+//!   1. parse     chunks of every CSV into records; events scattered by event_id,
+//!                clicks by user ID
+//!   2. link      IDs named in links/ -> each one's person name (union-find)
+//!   3. dedup     per event_id partition; survivors scattered by user ID
+//!   4. person    per user partition: user ID -> person name; scattered by person
+//!   5. sessions  per person partition: sort, sessions, click credit, aggregation
+//!   6. write     Parquet, one user_daily file per thread
 
 mod csv;
+mod io;
+mod key;
 mod output;
 mod par;
+mod scan;
 mod table;
 mod ts;
 
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use hashbrown::HashTable;
-use table::{Interner, Str, StrMap};
+use key::{Key, partition, remix};
+use table::{Str, StrMap};
 use ts::DAY_MS;
 
 #[global_allocator]
@@ -27,64 +38,48 @@ type Res<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 const GAP_MS: u32 = 30 * 60 * 1000;
 const WEEK_MS: i64 = 7 * DAY_MS;
-const CHUNK: usize = 4 << 20;
+const CHUNK: u64 = 512 << 10;
+/// Seconds from 0000-01-01 to the epoch: makes any F1 time non-negative.
+const YEAR_ZERO: i64 = 62_167_219_200;
+const VALID: u32 = 1 << 31;
+const EMPTY: u32 = u32::MAX;
 
-/// A reference to an event or click ID inside a mapped file: pointer plus length.
-/// IDs are the first field of their line, so one is always followed by `,` or `"`,
-/// which lets an over-long ID (65,535 bytes or more) be measured again on demand.
+/// One parsed event line, before dedup. 48 bytes.
 #[derive(Clone, Copy)]
-struct IdRef(u64);
-
-impl IdRef {
-    #[inline]
-    fn new(s: Str) -> Self {
-        IdRef(s.as_ptr() as u64 | (s.len().min(0xFFFF) as u64) << 48)
-    }
-
-    #[inline]
-    fn bytes(self) -> Str {
-        let p = (self.0 & 0xFFFF_FFFF_FFFF) as *const u8;
-        let mut n = (self.0 >> 48) as usize;
-        // SAFETY: the pointer came from a mapped file that lives for the whole run,
-        // and the ID is followed by a comma or its closing quote.
-        unsafe {
-            if n == 0xFFFF {
-                while !matches!(*p.add(n), b',' | b'"') {
-                    n += 1;
-                }
-            }
-            std::slice::from_raw_parts(p, n)
-        }
-    }
-}
-
-/// One parsed event line, before dedup.
-#[derive(Clone, Copy)]
+#[repr(C)]
 struct Event {
-    hash: u64,
-    id: IdRef,
-    /// Milliseconds since the epoch.
-    ingest: i64,
-    /// Milliseconds since `Ctx::base`. Meaningful only when valid.
+    id: Key,
+    /// Meaningful only when valid, like `ts`.
+    user: Key,
+    /// Ingest time in seconds since year 0 (high 40 bits), price in cents (low 24; 0 unless a purchase).
+    ingest_price: u64,
+    /// Milliseconds since `Ctx::base`.
     ts: u32,
-    user: u32,
-    /// `VALID` plus the price in cents (0 unless a purchase).
-    meta: u32,
+    /// Category, plus `VALID` if the event passes validation and is not late.
     category: u32,
 }
 
-const VALID: u32 = 1 << 31;
-
-/// One valid click, before dedup.
+/// A surviving event on its way to its person. `who` is the user ID, then the person's name.
 #[derive(Clone, Copy)]
+#[repr(C)]
+struct Survivor {
+    who: Key,
+    ts: u32,
+    price: u32,
+    category: u32,
+}
+
+/// A valid click. `who` is the user ID, then the person's name.
+#[derive(Clone, Copy)]
+#[repr(C)]
 struct Click {
-    id: IdRef,
-    user: u32,
+    who: Key,
+    id: Key,
     ts: u32,
     campaign: u32,
 }
 
-/// A surviving event, keyed for the per-person sort: person in the high half, time in the low.
+/// An event inside its person partition: person index in the high half of the key, time in the low.
 #[derive(Clone, Copy)]
 struct PersonEvent {
     key: u64,
@@ -95,7 +90,7 @@ struct PersonEvent {
 #[derive(Clone, Copy)]
 struct PersonClick {
     key: u64,
-    id: IdRef,
+    id: Key,
     campaign: u32,
 }
 
@@ -108,8 +103,8 @@ struct Ctx {
     products: StrMap,
     unknown_category: u32,
     campaigns: StrMap,
-    users: Interner,
     event_bits: u32,
+    user_bits: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -120,21 +115,14 @@ enum Kind {
 }
 
 struct Parsed {
-    /// Events by partition of their ID's hash.
+    /// By partition of the event ID.
     events: Vec<Vec<Event>>,
-    clicks: Vec<Click>,
-    links: Vec<(u32, u32)>,
-}
-
-#[inline]
-fn partition_of_hash(hash: u64, bits: u32) -> usize {
-    // Middle bits: the hash table uses the low bits for its slot and the top 7 as a tag.
-    ((hash >> 24) & ((1u64 << bits) - 1)) as usize
-}
-
-#[inline]
-fn partition_of_person(person: u32, bits: u32) -> usize {
-    if bits == 0 { 0 } else { (person.wrapping_mul(0x9E37_79B1) >> (32 - bits)) as usize }
+    /// By partition of the user ID.
+    clicks: Vec<Vec<Click>>,
+    links: Vec<(Key, Key)>,
+    buf: Vec<u8>,
+    tokens: Vec<u32>,
+    dates: ts::Dates,
 }
 
 /// A purchase price: ASCII digits only, 1 to 10,000,000, leading zeros allowed.
@@ -161,23 +149,31 @@ fn parse_price(b: &[u8]) -> Option<u32> {
     if (1..=10_000_000).contains(&v) { Some(v) } else { None }
 }
 
+// The three line parsers take lines from a chunk buffer, which keeps `io::SLACK`
+// readable bytes after its data; that is what makes the `Key` constructors sound.
+
 #[inline]
-fn parse_event(line: Str, ctx: &Ctx, out: &mut Parsed) {
-    // Events step 1: malformed lines and empty event IDs are gone before dedup.
-    let Some([id, user, ts, ingest, kind, product, price]) = csv::split::<7>(line) else { return };
+fn parse_event(&[id, user, ts, ingest, kind, product, price]: &[&[u8]; 7], ctx: &Ctx, out: &mut Parsed) {
+    // Events step 1: malformed lines never get here, and empty event IDs are gone before dedup.
     if id.is_empty() {
         return;
     }
     // The rules promise a valid F1 ingest_ts; a copy without one cannot be ordered, so it is dropped.
-    let Some(ingest) = ts::parse(ingest) else { return };
-    let mut event = Event { hash: table::hash(id), id: IdRef::new(id), ingest, ts: 0, user: 0, meta: 0, category: 0 };
+    let Some(ingest) = out.dates.parse_f1_secs(ingest) else { return };
+    let mut event = Event {
+        id: unsafe { Key::identity(id) },
+        user: Key::default(),
+        ingest_price: ((ingest + YEAR_ZERO) as u64) << 24,
+        ts: 0,
+        category: 0,
+    };
     // Steps 3 and 4, decided now but applied only to the copy that survives dedup.
     'valid: {
         if user.is_empty() || product.is_empty() {
             break 'valid;
         }
-        let Some(t) = ts::parse(ts) else { break 'valid };
-        if t < ctx.window_start || t >= ctx.window_end || ingest - t > DAY_MS {
+        let Some(t) = out.dates.parse(ts) else { break 'valid };
+        if t < ctx.window_start || t >= ctx.window_end || ingest * 1000 - t > DAY_MS {
             break 'valid;
         }
         let cents = match kind {
@@ -190,46 +186,44 @@ fn parse_event(line: Str, ctx: &Ctx, out: &mut Parsed) {
             _ => break 'valid,
         };
         event.ts = (t - ctx.base) as u32;
-        event.user = ctx.users.intern(user);
-        event.meta = VALID | cents;
+        event.user = unsafe { Key::text(user) };
+        event.ingest_price |= cents as u64;
+        event.category |= VALID;
     }
-    out.events[partition_of_hash(event.hash, ctx.event_bits)].push(event);
+    out.events[partition(event.id.hash(), ctx.event_bits)].push(event);
 }
 
 #[inline]
-fn parse_click(line: Str, ctx: &Ctx, out: &mut Parsed) {
-    let Some([id, user, campaign, ts]) = csv::split::<4>(line) else { return };
+fn parse_click(&[id, user, campaign, ts]: &[&[u8]; 4], ctx: &Ctx, out: &mut Parsed) {
+    // Clicks steps 1 and 3. Copies of a click are identical, so validating before dedup is the same.
     if id.is_empty() || user.is_empty() {
         return;
     }
     let Some(campaign) = ctx.campaigns.get(campaign) else { return };
-    let Some(t) = ts::parse(ts) else { return };
+    let Some(t) = out.dates.parse(ts) else { return };
     if t < ctx.base || t >= ctx.window_end {
         return;
     }
-    out.clicks.push(Click { id: IdRef::new(id), user: ctx.users.intern(user), ts: (t - ctx.base) as u32, campaign });
+    let who = unsafe { Key::text(user) };
+    out.clicks[partition(who.hash(), ctx.user_bits)].push(Click {
+        who,
+        id: unsafe { Key::text(id) },
+        ts: (t - ctx.base) as u32,
+        campaign,
+    });
 }
 
 #[inline]
-fn parse_link(line: Str, ctx: &Ctx, out: &mut Parsed) {
-    let Some([a, b]) = csv::split::<2>(line) else { return };
+fn parse_link(&[a, b]: &[&[u8]; 2], out: &mut Parsed) {
     if a.is_empty() || b.is_empty() {
         return;
     }
-    out.links.push((ctx.users.intern(a), ctx.users.intern(b)));
+    out.links.push(unsafe { (Key::text(a), Key::text(b)) });
 }
 
-/// Maps a file for the whole run. Its bytes are referenced until exit, so it is never unmapped.
-fn map_file(path: &Path) -> Res<Str> {
-    let file = std::fs::File::open(path)?;
-    if file.metadata()?.len() == 0 {
-        return Ok(b"");
-    }
-    // SAFETY: /data is read-only and nothing changes the files during a run.
-    let map = unsafe { memmap2::Mmap::map(&file)? };
-    #[cfg(unix)]
-    let _ = map.advise(memmap2::Advice::Sequential);
-    Ok(&Box::leak(Box::new(map))[..])
+/// A whole small file, kept for the run because names point into it.
+fn read_static(path: &Path) -> Res<Str> {
+    Ok(Box::leak(std::fs::read(path)?.into_boxed_slice()))
 }
 
 /// Every `*.csv` file directly in `dir`.
@@ -260,14 +254,112 @@ fn pairs(data: Str) -> Vec<(Str, Str)> {
     rows
 }
 
+/// The string values of the top-level keys of a JSON object. Nested values and
+/// keys that merely appear inside other strings are skipped, not matched.
+fn json_top_level_strings(text: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    // Reads the string starting at the quote at `i`; returns its raw bytes and the index after it.
+    fn string(text: &[u8], mut i: usize) -> Option<(Vec<u8>, usize)> {
+        let mut out = Vec::new();
+        i += 1;
+        while i < text.len() {
+            match text[i] {
+                b'"' => return Some((out, i + 1)),
+                b'\\' if i + 1 < text.len() => {
+                    out.push(text[i + 1]);
+                    i += 2;
+                }
+                c => {
+                    out.push(c);
+                    i += 1;
+                }
+            }
+        }
+        None
+    }
+    let mut found = Vec::new();
+    let mut i = 0;
+    let space = |i: &mut usize| {
+        while *i < text.len() && text[*i].is_ascii_whitespace() {
+            *i += 1;
+        }
+    };
+    space(&mut i);
+    if i >= text.len() || text[i] != b'{' {
+        return found;
+    }
+    i += 1;
+    loop {
+        space(&mut i);
+        if i >= text.len() || text[i] != b'"' {
+            return found;
+        }
+        let Some((key, after)) = string(text, i) else { return found };
+        i = after;
+        space(&mut i);
+        if i >= text.len() || text[i] != b':' {
+            return found;
+        }
+        i += 1;
+        space(&mut i);
+        if i < text.len() && text[i] == b'"' {
+            let Some((value, after)) = string(text, i) else { return found };
+            found.push((key, value));
+            i = after;
+        } else {
+            // Any other value: skip to the comma or brace that ends it at this depth.
+            let mut depth = 0usize;
+            while i < text.len() {
+                match text[i] {
+                    b'"' => match string(text, i) {
+                        Some((_, after)) => {
+                            i = after;
+                            continue;
+                        }
+                        None => return found,
+                    },
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' if depth > 0 => depth -= 1,
+                    b',' | b'}' if depth == 0 => break,
+                    _ => {}
+                }
+                i += 1;
+            }
+        }
+        space(&mut i);
+        if i >= text.len() || text[i] != b',' {
+            return found;
+        }
+        i += 1;
+    }
+}
+
 /// The timestamp stored under `key` in manifest.json.
 fn manifest_time(text: &[u8], key: &str) -> Res<i64> {
-    let needle = format!("\"{key}\"");
-    let at = memchr::memmem::find(text, needle.as_bytes()).ok_or("manifest: key missing")?;
-    let rest = &text[at + needle.len()..];
-    let open = memchr::memchr(b'"', rest).ok_or("manifest: value missing")?;
-    let close = memchr::memchr(b'"', &rest[open + 1..]).ok_or("manifest: value unterminated")?;
-    ts::parse(&rest[open + 1..open + 1 + close]).ok_or_else(|| "manifest: bad timestamp".into())
+    let values = json_top_level_strings(text);
+    let value = values.iter().find(|(k, _)| k == key.as_bytes()).ok_or("manifest: key missing")?;
+    ts::parse(&value.1).ok_or_else(|| "manifest: bad timestamp".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manifest_reader() {
+        let t = |text: &str, key: &str| manifest_time(text.as_bytes(), key).ok();
+        let plain = r#"{"window_start": "2026-10-01T00:00:00Z", "window_end": "2026-10-15T00:00:00Z"}"#;
+        assert_eq!(t(plain, "window_start"), Some(1_790_812_800_000));
+        assert_eq!(t(plain, "window_end"), Some(1_792_022_400_000));
+        let tricky = r#" {"note": "window_start", "sizes": {"events": 4, "window_end": 3, "x": ["}", {"window_start": "1"}]},
+            "n": -1.5e3, "b": true, "z": null, "esc": "a\"b", "window_end":"2026-10-15T00:00:00Z" ,
+            "window_start"
+            : "2026-10-01T00:00:00Z"} "#;
+        assert_eq!(t(tricky, "window_start"), Some(1_790_812_800_000));
+        assert_eq!(t(tricky, "window_end"), Some(1_792_022_400_000));
+        assert_eq!(t(plain, "window"), None);
+        assert_eq!(t("", "window_start"), None);
+        assert_eq!(t(r#"{"window_start": 5}"#, "window_start"), None);
+    }
 }
 
 fn bits_for(count: usize, per_partition: usize, max_bits: u32) -> u32 {
@@ -275,11 +367,18 @@ fn bits_for(count: usize, per_partition: usize, max_bits: u32) -> u32 {
     wanted.trailing_zeros().min(max_bits)
 }
 
+fn buckets<T>(bits: u32) -> Vec<Vec<T>> {
+    (0..1usize << bits).map(|_| Vec::new()).collect()
+}
+
 /// Per-thread state of the sessions stage.
 struct Sessions {
     rows: output::UserRows,
     /// Per (campaign, day): sessions, purchasing sessions, revenue, assisted sessions.
     campaign_days: Vec<[u64; 4]>,
+    /// Person name -> index into `names`, for this partition.
+    people: HashTable<(Key, u32)>,
+    names: Vec<Key>,
     events: Vec<PersonEvent>,
     clicks: Vec<PersonClick>,
     /// Clicks per campaign inside the current 7-day window, and the campaigns present.
@@ -333,7 +432,7 @@ fn main() -> Res<()> {
         id
     };
     let mut products = StrMap::default();
-    for (product, category) in pairs(map_file(&data_dir.join("products.csv"))?) {
+    for (product, category) in pairs(read_static(&data_dir.join("products.csv"))?) {
         let category = category_id(category);
         products.get_or_insert(product, category);
     }
@@ -342,7 +441,7 @@ fn main() -> Res<()> {
     let mut campaigns = StrMap::default();
     let mut campaign_names: Vec<Str> = Vec::new();
     let mut channels: Vec<Str> = Vec::new();
-    for (campaign, channel) in pairs(map_file(&data_dir.join("campaigns.csv"))?) {
+    for (campaign, channel) in pairs(read_static(&data_dir.join("campaigns.csv"))?) {
         let id = campaigns.get_or_insert(campaign, campaign_names.len() as u32);
         if id as usize == campaign_names.len() {
             campaign_names.push(campaign);
@@ -353,56 +452,121 @@ fn main() -> Res<()> {
     campaign_names.push(b"organic");
     channels.push(b"organic");
 
-    let mut chunks: Vec<(Kind, Str, usize, usize)> = Vec::new();
-    let mut event_bytes = 0;
+    let mut files: Vec<(File, u64)> = Vec::new();
+    let mut chunks: Vec<(Kind, usize, u64, u64)> = Vec::new();
+    let mut event_bytes = 0u64;
     for (kind, folder) in [(Kind::Events, "events"), (Kind::Clicks, "clicks"), (Kind::Links, "links")] {
         for path in csv_files(&data_dir.join(folder))? {
-            let data = map_file(&path)?;
+            let file = File::open(&path)?;
+            let len = file.metadata()?.len();
             if matches!(kind, Kind::Events) {
-                event_bytes += data.len();
+                event_bytes += len;
             }
             let mut start = 0;
-            while start < data.len() {
-                let end = (start + CHUNK).min(data.len());
-                chunks.push((kind, data, start, end));
+            while start < len {
+                let end = (start + CHUNK).min(len);
+                chunks.push((kind, files.len(), start, end));
                 start = end;
             }
+            files.push((file, len));
         }
     }
-    let rough_events = event_bytes / 64;
-    let event_bits = bits_for(rough_events, 1 << 16, 11);
-    let person_bits = bits_for(rough_events, 1 << 17, 10);
-    let ctx = Ctx {
-        window_start,
-        window_end,
-        base,
-        products,
-        unknown_category,
-        campaigns,
-        users: Interner::new(),
-        event_bits,
-    };
+    let rough_events = (event_bytes / 64) as usize;
+    let event_bits = bits_for(rough_events, 1 << 15, 12);
+    let user_bits = bits_for(rough_events, 1 << 16, 11);
+    let person_bits = user_bits;
+    let ctx = Ctx { window_start, window_end, base, products, unknown_category, campaigns, event_bits, user_bits };
     log("open");
 
     // ---- 1. Parse ------------------------------------------------------------------------
-    let parsed = par::run(
+    let mut parsed = par::run(
         threads,
         chunks.len(),
-        |_| Parsed { events: (0..1 << event_bits).map(|_| Vec::new()).collect(), clicks: Vec::new(), links: Vec::new() },
+        |_| Parsed { events: buckets(event_bits), clicks: buckets(user_bits), links: Vec::new(), buf: Vec::new(), tokens: Vec::new(), dates: ts::Dates::new() },
         |out, i| {
-            let (kind, data, start, end) = chunks[i];
+            let (kind, file, start, end) = chunks[i];
+            let mut buf = std::mem::take(&mut out.buf);
+            let (len, first) = io::load_chunk(&files[file].0, files[file].1, start, end, &mut buf).expect("read failed");
+            let (data, last) = (&buf[..len], first + (end - start) as usize);
+            let mut tokens = std::mem::take(&mut out.tokens);
+            scan::index(data, &mut tokens);
             match kind {
-                Kind::Events => csv::for_each_line(data, start, end, |line| parse_event(line, &ctx, out)),
-                Kind::Clicks => csv::for_each_line(data, start, end, |line| parse_click(line, &ctx, out)),
-                Kind::Links => csv::for_each_line(data, start, end, |line| parse_link(line, &ctx, out)),
+                Kind::Events => scan::for_each_record(data, first, last, &tokens, |fields| parse_event(fields, &ctx, out)),
+                Kind::Clicks => scan::for_each_record(data, first, last, &tokens, |fields| parse_click(fields, &ctx, out)),
+                Kind::Links => scan::for_each_record(data, first, last, &tokens, |fields| parse_link(fields, out)),
             }
+            out.buf = buf;
+            out.tokens = tokens;
         },
     );
+    drop(files);
     log("parse");
 
     // ---- 2. Linked IDs -------------------------------------------------------------------
-    let names = ctx.users.into_names();
-    let mut parent: Vec<u32> = (0..names.len() as u32).collect();
+    // Give every ID that appears in a link a number, partition by partition.
+    let user_parts = 1usize << user_bits;
+    let mut link_base = vec![0usize; parsed.len() + 1];
+    for (t, thread) in parsed.iter().enumerate() {
+        link_base[t + 1] = link_base[t] + thread.links.len();
+    }
+    let link_count = link_base[parsed.len()];
+    // An endpoint: the ID, and which side of which link it is.
+    let ends = par::run(
+        threads,
+        parsed.len(),
+        |_| buckets::<(Key, u32)>(user_bits),
+        |out, t| {
+            for (i, &(a, b)) in parsed[t].links.iter().enumerate() {
+                let slot = ((link_base[t] + i) * 2) as u32;
+                out[partition(a.hash(), user_bits)].push((a, slot));
+                out[partition(b.hash(), user_bits)].push((b, slot + 1));
+            }
+        },
+    );
+    struct Nodes {
+        ids: Vec<Key>,
+        /// (endpoint slot, index into `ids`)
+        ends: Vec<(u32, u32)>,
+    }
+    let nodes: Vec<Nodes> = par::map(threads, user_parts, |part| {
+        let mut table: HashTable<(Key, u32)> = HashTable::new();
+        let mut found = Nodes { ids: Vec::new(), ends: Vec::new() };
+        for thread in &ends {
+            for &(id, slot) in &thread[part] {
+                let h = remix(id.hash());
+                let index = match table.find(h, |e| e.0 == id) {
+                    Some(e) => e.1,
+                    None => {
+                        let index = found.ids.len() as u32;
+                        found.ids.push(id);
+                        table.insert_unique(h, (id, index), |e| remix(e.0.hash()));
+                        index
+                    }
+                };
+                found.ends.push((slot, index));
+            }
+        }
+        found
+    });
+    drop(ends);
+    let mut node_base = vec![0u32; user_parts + 1];
+    for part in 0..user_parts {
+        node_base[part + 1] = node_base[part] + nodes[part].ids.len() as u32;
+    }
+    let node_count = node_base[user_parts] as usize;
+    let mut endpoint = vec![0u32; link_count * 2];
+    {
+        let cells = par::Shared(endpoint.as_mut_ptr());
+        par::run(threads, user_parts, |_| (), |_, part| {
+            let cells = cells;
+            for &(slot, index) in &nodes[part].ends {
+                // SAFETY: every slot belongs to exactly one endpoint, so no two writes collide.
+                unsafe { *cells.0.add(slot as usize) = node_base[part] + index };
+            }
+        });
+    }
+    // Links step 2: union-find over the link pairs.
+    let mut parent: Vec<u32> = (0..node_count as u32).collect();
     fn find(parent: &mut [u32], mut x: u32) -> u32 {
         while parent[x as usize] != x {
             let up = parent[parent[x as usize] as usize];
@@ -411,87 +575,141 @@ fn main() -> Res<()> {
         }
         x
     }
-    for thread in &parsed {
-        for &(a, b) in &thread.links {
-            let (a, b) = (find(&mut parent, a), find(&mut parent, b));
-            if a != b {
-                parent[a.max(b) as usize] = a.min(b);
+    for pair in endpoint.chunks_exact(2) {
+        let (a, b) = (find(&mut parent, pair[0]), find(&mut parent, pair[1]));
+        if a != b {
+            parent[a.max(b) as usize] = a.min(b);
+        }
+    }
+    drop(endpoint);
+    // Links step 3: each person is named by the byte-wise smallest of their IDs.
+    let mut name: Vec<Key> = nodes.iter().flat_map(|n| n.ids.iter().copied()).collect();
+    let all_ids = name.clone();
+    for node in 0..node_count {
+        let root = find(&mut parent, node as u32) as usize;
+        if all_ids[node].cmp_bytes(&name[root]).is_lt() {
+            name[root] = all_ids[node];
+        }
+    }
+    drop(all_ids);
+    // Per partition: linked ID -> person name, for the IDs that are not their own person's name.
+    // An ID missing from these tables is a person on its own, or is itself the name.
+    let renames: Vec<HashTable<(Key, Key)>> = par::map(threads, user_parts, |part| {
+        let mut table = HashTable::new();
+        for (index, &id) in nodes[part].ids.iter().enumerate() {
+            // Roots point at themselves and every other node at most two steps away after
+            // the pass above, so follow without compressing.
+            let mut root = node_base[part] as usize + index;
+            while parent[root] as usize != root {
+                root = parent[root] as usize;
+            }
+            if name[root] != id {
+                table.insert_unique(remix(id.hash()), (id, name[root]), |e: &(Key, Key)| remix(e.0.hash()));
             }
         }
-    }
-    // Each ID's person, and each person's name: the byte-wise smallest of their IDs.
-    let mut person_of = vec![0u32; names.len()];
-    let mut person_name = names.clone();
-    for id in 0..names.len() {
-        let root = find(&mut parent, id as u32) as usize;
-        person_of[id] = root as u32;
-        if names[id] < person_name[root] {
-            person_name[root] = names[id];
-        }
-    }
-    drop(parent);
+        table
+    });
+    drop((nodes, parent, name));
     log("link");
 
-    // ---- 3. Dedup events, then scatter survivors and clicks by person ----------------------
-    let person_parts = 1usize << person_bits;
-    struct Dedup<'a> {
-        seen: HashTable<&'a Event>,
-        out: Vec<Vec<PersonEvent>>,
+    // ---- 3. Dedup events; scatter survivors by user ID --------------------------------------
+    struct Dedup {
+        events: Vec<Event>,
+        slots: Vec<u32>,
+        out: Vec<Vec<Survivor>>,
     }
     let deduped = par::run(
         threads,
         1 << event_bits,
-        |_| Dedup { seen: HashTable::new(), out: (0..person_parts).map(|_| Vec::new()).collect() },
+        |_| Dedup { events: Vec::new(), slots: Vec::new(), out: buckets(user_bits) },
         |state, part| {
-            state.seen.clear();
-            state.seen.reserve(parsed.iter().map(|t| t.events[part].len()).sum(), |e| e.hash);
+            state.events.clear();
             for thread in &parsed {
-                for event in &thread.events[part] {
-                    // Events step 2: one copy per event_id, the one ingested first.
-                    match state.seen.find_mut(event.hash, |o| o.hash == event.hash && o.id.bytes() == event.id.bytes()) {
-                        Some(kept) => {
-                            if event.ingest < kept.ingest {
-                                *kept = event;
-                            }
-                        }
-                        None => {
-                            state.seen.insert_unique(event.hash, event, |e| e.hash);
-                        }
+                state.events.extend_from_slice(&thread.events[part]);
+            }
+            let events = &state.events;
+            if events.is_empty() {
+                return;
+            }
+            let capacity = (events.len() * 2).next_power_of_two().max(16);
+            let shift = 64 - capacity.trailing_zeros();
+            state.slots.clear();
+            state.slots.resize(capacity, EMPTY);
+            for (i, event) in events.iter().enumerate() {
+                // Events step 2: one copy per event_id, the one ingested first.
+                let mut at = (remix(event.id.hash()) >> shift) as usize;
+                loop {
+                    let held = state.slots[at];
+                    if held == EMPTY {
+                        state.slots[at] = i as u32;
+                        break;
                     }
+                    let kept = &events[held as usize];
+                    if kept.id == event.id {
+                        if event.ingest_price >> 24 < kept.ingest_price >> 24 {
+                            state.slots[at] = i as u32;
+                        }
+                        break;
+                    }
+                    at = (at + 1) & (capacity - 1);
                 }
             }
-            for event in state.seen.iter() {
-                if event.meta & VALID != 0 {
-                    let person = person_of[event.user as usize];
-                    state.out[partition_of_person(person, person_bits)].push(PersonEvent {
-                        key: (person as u64) << 32 | event.ts as u64,
-                        price: event.meta & !VALID,
-                        category: event.category,
+            for &held in &state.slots {
+                if held == EMPTY {
+                    continue;
+                }
+                let event = &events[held as usize];
+                if event.category & VALID != 0 {
+                    state.out[partition(event.user.hash(), user_bits)].push(Survivor {
+                        who: event.user,
+                        ts: event.ts,
+                        price: (event.ingest_price & 0xFF_FFFF) as u32,
+                        category: event.category & !VALID,
                     });
                 }
             }
         },
     );
-    let person_events: Vec<Vec<Vec<PersonEvent>>> = deduped.into_iter().map(|d| d.out).collect();
-    let person_clicks = par::run(
+    for thread in &mut parsed {
+        thread.events = Vec::new();
+    }
+    log("dedup");
+
+    // ---- 4. User ID -> person; scatter by person ---------------------------------------------
+    struct ByPerson {
+        events: Vec<Vec<Survivor>>,
+        clicks: Vec<Vec<Click>>,
+    }
+    let by_person = par::run(
         threads,
-        parsed.len(),
-        |_| (0..person_parts).map(|_| Vec::new()).collect::<Vec<Vec<PersonClick>>>(),
-        |out, t| {
-            for click in &parsed[t].clicks {
-                let person = person_of[click.user as usize];
-                out[partition_of_person(person, person_bits)].push(PersonClick {
-                    key: (person as u64) << 32 | click.ts as u64,
-                    id: click.id,
-                    campaign: click.campaign,
-                });
+        user_parts,
+        |_| ByPerson { events: buckets(person_bits), clicks: buckets(person_bits) },
+        |out, part| {
+            let renames = &renames[part];
+            let person = |id: Key| -> Key {
+                if renames.is_empty() {
+                    return id;
+                }
+                renames.find(remix(id.hash()), |e| e.0 == id).map_or(id, |e| e.1)
+            };
+            for thread in &deduped {
+                for event in &thread.out[part] {
+                    let who = person(event.who);
+                    out.events[partition(who.hash(), person_bits)].push(Survivor { who, ..*event });
+                }
+            }
+            for thread in &parsed {
+                for click in &thread.clicks[part] {
+                    let who = person(click.who);
+                    out.clicks[partition(who.hash(), person_bits)].push(Click { who, ..*click });
+                }
             }
         },
     );
-    drop(parsed);
-    log("dedup");
+    drop((parsed, deduped, renames));
+    log("person");
 
-    // ---- 4. Sessions, credit, assists, aggregation -----------------------------------------
+    // ---- 5. Sessions, credit, assists, aggregation -----------------------------------------
     let first_day = window_start.div_euclid(DAY_MS);
     let days = ((window_end - 1).div_euclid(DAY_MS) - first_day + 1).max(1) as usize;
     let campaign_count = campaign_names.len();
@@ -505,10 +723,12 @@ fn main() -> Res<()> {
 
     let sessions = par::run(
         threads,
-        person_parts,
+        1 << person_bits,
         |_| Sessions {
             rows: output::UserRows::default(),
             campaign_days: vec![[0; 4]; campaign_count * days],
+            people: HashTable::new(),
+            names: Vec::new(),
             events: Vec::new(),
             clicks: Vec::new(),
             in_window: vec![0; campaign_count],
@@ -517,9 +737,23 @@ fn main() -> Res<()> {
             day_categories: Vec::new(),
         },
         |s, part| {
+            s.people.clear();
+            s.names.clear();
             s.events.clear();
-            for thread in &person_events {
-                s.events.extend_from_slice(&thread[part]);
+            for thread in &by_person {
+                for event in &thread.events[part] {
+                    let h = remix(event.who.hash());
+                    let person = match s.people.find(h, |e| e.0 == event.who) {
+                        Some(e) => e.1,
+                        None => {
+                            let person = s.names.len() as u32;
+                            s.names.push(event.who);
+                            s.people.insert_unique(h, (event.who, person), |e| remix(e.0.hash()));
+                            person
+                        }
+                    };
+                    s.events.push(PersonEvent { key: (person as u64) << 32 | event.ts as u64, price: event.price, category: event.category });
+                }
             }
             if s.events.is_empty() {
                 return;
@@ -527,16 +761,20 @@ fn main() -> Res<()> {
             // Events step 5: each person's events in time order.
             s.events.sort_unstable_by_key(|e| e.key);
 
-            // Clicks step 2 happens here: copies of a click are identical, so they share a
-            // person and a time and end up next to each other.
             s.clicks.clear();
-            for thread in &person_clicks {
-                s.clicks.extend_from_slice(&thread[part]);
+            for thread in &by_person {
+                for click in &thread.clicks[part] {
+                    // A person with no surviving events has no sessions to credit.
+                    if let Some(e) = s.people.find(remix(click.who.hash()), |e| e.0 == click.who) {
+                        s.clicks.push(PersonClick { key: (e.1 as u64) << 32 | click.ts as u64, id: click.id, campaign: click.campaign });
+                    }
+                }
             }
             // Within one millisecond the smallest click_id goes last, so "the last click at or
             // before the session start" is the one the tie rule picks.
-            s.clicks.sort_unstable_by(|a, b| a.key.cmp(&b.key).then_with(|| b.id.bytes().cmp(a.id.bytes())));
-            s.clicks.dedup_by(|b, a| a.key == b.key && a.id.bytes() == b.id.bytes());
+            s.clicks.sort_unstable_by(|a, b| a.key.cmp(&b.key).then_with(|| b.id.cmp_bytes(&a.id)));
+            // Clicks step 2: copies of a click are identical, so they are neighbours now.
+            s.clicks.dedup_by(|b, a| a.key == b.key && a.id == b.id);
 
             let (events, clicks) = (&s.events, &s.clicks);
             let mut next_click = 0;
@@ -566,7 +804,7 @@ fn main() -> Res<()> {
                         .max_by(|a, b| a.1.cmp(&b.1).then_with(|| category_rank[b.0 as usize].cmp(&category_rank[a.0 as usize])))
                         .map(|&(c, _)| category_names[c as usize]);
                     categories.clear();
-                    s.rows.user_id.push(person_name[person as usize]);
+                    s.rows.user_id.push(s.names[person as usize]);
                     s.rows.day.push(day as i32);
                     s.rows.sessions.push(sessions);
                     s.rows.events.push(events);
@@ -649,7 +887,7 @@ fn main() -> Res<()> {
     );
     log("sessions");
 
-    // ---- 5. Write ------------------------------------------------------------------------
+    // ---- 6. Write ------------------------------------------------------------------------
     let user_dir = out_dir.join("user_daily");
     let campaign_dir = out_dir.join("campaign_daily");
     for folder in [&user_dir, &campaign_dir] {

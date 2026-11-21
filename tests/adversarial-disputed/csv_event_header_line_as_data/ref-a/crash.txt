@@ -1,0 +1,13 @@
+exit 1
+Traceback (most recent call last):
+  File "/Users/jayson/Documents/code/builders/reference/a/reference.py", line 631, in <module>
+    main()
+  File "/Users/jayson/Documents/code/builders/reference/a/reference.py", line 624, in main
+    events_of = surviving_events_by_person(data_dir, name_of, window_start, window_end)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/jayson/Documents/code/builders/reference/a/reference.py", line 408, in surviving_events_by_person
+    for ingest_ms, fields in read_deduped_events(data_dir).values():
+                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/jayson/Documents/code/builders/reference/a/reference.py", line 360, in read_deduped_events
+    raise ValueError("%s: ingest_ts is not valid F1: %r" % (path, line))
+ValueError: /Users/jayson/Documents/code/builders/tests/adversarial-disputed/csv_event_header_line_as_data/input/events/part-00000.csv: ingest_ts is not valid F1: b'event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents'

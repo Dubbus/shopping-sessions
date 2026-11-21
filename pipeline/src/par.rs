@@ -1,8 +1,8 @@
-//! A minimal parallel-for: `threads` workers pull item indexes from a shared
-//! counter, each with its own state, and the states come back in thread order.
+//! Minimal parallel loops over item indexes: workers pull from a shared counter.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// Each worker has its own state; the states come back in thread order.
 pub fn run<S: Send>(
     threads: usize,
     items: usize,
@@ -31,3 +31,17 @@ pub fn run<S: Send>(
         handles.into_iter().map(|h| h.join().expect("worker panicked")).collect()
     })
 }
+
+/// One result per item, in item order.
+pub fn map<R: Send>(threads: usize, items: usize, work: impl Fn(usize) -> R + Sync) -> Vec<R> {
+    let mut tagged: Vec<(usize, R)> =
+        run(threads, items, |_| Vec::new(), |out: &mut Vec<(usize, R)>, i| out.push((i, work(i)))).into_iter().flatten().collect();
+    tagged.sort_unstable_by_key(|r| r.0);
+    tagged.into_iter().map(|r| r.1).collect()
+}
+
+/// A raw pointer that may cross threads, for writes to provably disjoint slots.
+#[derive(Clone, Copy)]
+pub struct Shared<T>(pub *mut T);
+unsafe impl<T> Send for Shared<T> {}
+unsafe impl<T> Sync for Shared<T> {}

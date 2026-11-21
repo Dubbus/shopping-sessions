@@ -148,12 +148,17 @@ fn civil(s: &[u8]) -> Option<i64> {
     if !seps_ok || !all_digits(x0, D0) || !all_digits(x1, D1) || !all_digits(x2, D2) {
         return None;
     }
-    let y = byte(x0, 0) * 1000 + byte(x0, 1) * 100 + byte(x0, 2) * 10 + byte(x0, 3);
-    let mo = byte(x0, 5) * 10 + byte(x0, 6);
-    let dd = byte(x1, 0) * 10 + byte(x1, 1);
-    let h = byte(x1, 3) * 10 + byte(x1, 4);
-    let mi = byte(x1, 6) * 10 + byte(x1, 7);
-    let se = byte(x2, 5) * 10 + byte(x2, 6);
+    // Pairwise SWAR: x*10 + (x>>8) puts 10*b[k] + b[k+1] in byte k for every k at once
+    // (digits <= 9 and separators 0, so no carries cross bytes).
+    let p0 = x0.wrapping_mul(10).wrapping_add(x0 >> 8); // bytes 0,2: YY YY; byte 5: MM
+    let p1 = x1.wrapping_mul(10).wrapping_add(x1 >> 8); // bytes 0: DD, 3: HH, 6: mm
+    let p2 = x2.wrapping_mul(10).wrapping_add(x2 >> 8); // byte 5: SS
+    let y = ((p0 & 0xff) * 100 + ((p0 >> 16) & 0xff)) as i64;
+    let mo = ((p0 >> 40) & 0xff) as i64;
+    let dd = (p1 & 0xff) as i64;
+    let h = ((p1 >> 24) & 0xff) as i64;
+    let mi = ((p1 >> 48) & 0xff) as i64;
+    let se = ((p2 >> 40) & 0xff) as i64;
     if !(1..=12).contains(&mo) || h > 23 || mi > 59 || se > 59 || dd < 1 {
         return None;
     }

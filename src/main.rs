@@ -270,7 +270,7 @@ fn main() {
     for (p, c) in &prod_raw {
         products.insert(p, cat_index[&c[..]]);
     }
-    products.finish();
+    products.finish16(|v| v);
     let ncats = cat_names.len();
     assert!(ncats <= 255, "more than 255 categories: packed price|category needs widening");
 
@@ -931,7 +931,7 @@ fn field_bench(path: &Path, ids: &Interner, products: &Lookup<u16>, unknown_cat:
     time!("ingest", |f: &scan::Line| ts::parse(&f[3]).unwrap_or(0) as u64);
     time!("eid key", |f: &scan::Line| unsafe { ids.key_padded(&f[0]) });
     time!("uid key", |f: &scan::Line| unsafe { ids.key_padded(&f[1]) });
-    time!("product", |f: &scan::Line| unsafe { products.get_padded(&f[5]) }.unwrap_or(0) as u64);
+    time!("product", |f: &scan::Line| unsafe { products.get16_padded(&f[5]) }.unwrap_or(0) as u64);
     time!("event_rec", |f: &scan::Line| { let e = event_rec(f, &ctx); e.eid ^ e.pc as u64 });
 }
 
@@ -978,7 +978,7 @@ fn event_rec(f: &scan::Line, c: &EvCtx) -> Ev {
     {
         let p = if kind == PURCHASE { price(&f[6]) } else { Some(0) };
         if let Some(p) = p {
-            let cat = unsafe { c.products.get_padded(&f[5]) }.unwrap_or(c.unknown_cat) as u32;
+            let cat = unsafe { c.products.get16_padded(&f[5]) }.unwrap_or(c.unknown_cat) as u32;
             e.pc = p | cat << 24;
             e.t = (t - c.ws) as u32;
             e.person = unsafe { c.ids.key_padded(&f[1]) };

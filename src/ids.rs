@@ -140,6 +140,9 @@ pub struct Lookup<V: Copy> {
     /// When every key is `prefix` + a canonical decimal (like `p123`, `c_45`), an array
     /// indexed by the number. Exact: a query of any other shape can match no key.
     dense: Option<(Vec<u8>, Vec<Option<V>>)>,
+    /// Fast form of `dense` for prefixes of <= 7 bytes: (prefix as LE u64, prefix length,
+    /// table of u16 values with u16::MAX = absent). Only used when V fits in u16.
+    dense16: Option<(u64, usize, Vec<u16>)>,
     keys: Vec<Vec<u8>>,
 }
 
@@ -187,7 +190,7 @@ unsafe fn canonical_number_padded(rest: &[u8]) -> Option<usize> {
 
 impl<V: Copy> Lookup<V> {
     pub fn new() -> Self {
-        Self { packed: FxMap::default(), other: FxMap::default(), dense: None, keys: Vec::new() }
+        Self { packed: FxMap::default(), other: FxMap::default(), dense: None, dense16: None, keys: Vec::new() }
     }
 
     /// Call after the last insert: switches to the dense array when the keys allow it.
@@ -207,6 +210,19 @@ impl<V: Copy> Lookup<V> {
             table[n] = self.get(k);
         }
         self.dense = Some((prefix, table));
+    }
+
+    /// Like `finish`, and also builds the u16 fast table (values must be < u16::MAX).
+    pub fn finish16(&mut self, as_u16: impl Fn(V) -> u16) {
+        self.finish();
+        if let Some((prefix, table)) = &self.dense
+            && prefix.len() <= 7
+        {
+            let mut p = [0u8; 8];
+            p[..prefix.len()].copy_from_slice(prefix);
+            let t = table.iter().map(|v| v.map(&as_u16).unwrap_or(u16::MAX)).collect();
+            self.dense16 = Some((u64::from_le_bytes(p), prefix.len(), t));
+        }
     }
     pub fn insert(&mut self, b: &[u8], v: V) {
         self.keys.push(b.to_vec());
@@ -234,6 +250,38 @@ impl<V: Copy> Lookup<V> {
     ///
     /// # Safety
     /// 8 bytes past the end of `b` must be readable.
+    /// `get_padded` returning the u16 form (u16::MAX = absent); needs `finish16`.
+    ///
+    /// # Safety
+    /// 16 bytes from `b.as_ptr()` must be readable.
+    #[cfg_attr(feature = "prof", inline(never))]
+    #[cfg_attr(not(feature = "prof"), inline(always))]
+    pub unsafe fn get16_padded(&self, b: &[u8]) -> Option<u16>
+    where
+        V: Into<u16>,
+    {
+        if let Some((pre, plen, table)) = &self.dense16 {
+            let n = b.len();
+            if n <= *plen || n > plen + 7 {
+                return None;
+            }
+            let raw = unsafe { std::ptr::read_unaligned(b.as_ptr() as *const u64) };
+            let pmask = (1u64 << (8 * plen)) - 1;
+            if raw & pmask != *pre {
+                return None;
+            }
+            let rest = unsafe { std::slice::from_raw_parts(b.as_ptr().add(*plen), n - plen) };
+            return match unsafe { canonical_number_padded(rest) } {
+                Some(i) => match table.get(i) {
+                    Some(&v) if v != u16::MAX => Some(v),
+                    _ => None,
+                },
+                None => None,
+            };
+        }
+        unsafe { self.get_padded(b) }.map(Into::into)
+    }
+
     #[inline(always)]
     pub unsafe fn get_padded(&self, b: &[u8]) -> Option<V> {
         if let Some((prefix, table)) = &self.dense
@@ -290,6 +338,20 @@ mod tests {
             buf.extend_from_slice(&[b'9'; 16]);
             let n = v.to_string().len();
             assert_eq!(unsafe { canonical_number_padded(&buf[..n]) }, Some(v));
+        }
+    }
+
+    #[test]
+    fn get16_matches_get() {
+        let mut l: Lookup<u16> = Lookup::new();
+        for i in 1..=500u16 {
+            l.insert(format!("p{i}").as_bytes(), i % 21);
+        }
+        l.finish16(|v| v);
+        for q in ["p1", "p500", "p501", "p0", "p01", "P1", "p", "", "x1", "p1 ", " p1", "p12345678", "p99", "pp1"] {
+            let mut buf = q.as_bytes().to_vec();
+            buf.extend_from_slice(&[b'7'; 16]);
+            assert_eq!(unsafe { l.get16_padded(&buf[..q.len()]) }, l.get(q.as_bytes()), "{q}");
         }
     }
 

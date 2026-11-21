@@ -1,0 +1,4 @@
+# The image is built from pipeline/ alone.
+*
+!pipeline/
+pipeline/target/

@@ -3,7 +3,9 @@ target/
 out/
 
 # Generated datasets (never checked in; the scorer mounts its own)
-dev/
 data/
 
+# Local tooling
+.venv/
+__pycache__/
 .DS_Store

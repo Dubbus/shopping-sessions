@@ -496,19 +496,84 @@ fn main() {
 
     // ---- sessions, credit, assists per person bucket ----
     let parts: Vec<Part> = par(nb, threads, |b| {
+        // Group by person with a counting sort on dense local person numbers, then sort
+        // each person's few events by ts. Much cheaper than sorting the bucket by (person, ts).
         let n: usize = deduped.iter().map(|p| p.out[b].len()).sum();
-        let mut ev: Vec<PEv> = Vec::with_capacity(n);
-        for p in &deduped {
-            ev.extend_from_slice(&p.out[b]);
+        let mut local = Table::with_capacity(n / 16 + 16);
+        let mut keys: Vec<u64> = Vec::with_capacity(n / 16 + 16);
+        let mut ev_off: Vec<u32> = Vec::with_capacity(n / 16 + 16);
+        let mut pid: Vec<u32> = Vec::with_capacity(n);
+        for d in &deduped {
+            for e in &d.out[b] {
+                let next = keys.len() as u64;
+                let (slot, new) = local.entry(e.person, next);
+                let q = *slot as usize;
+                if new {
+                    keys.push(e.person);
+                    ev_off.push(0);
+                }
+                ev_off[q] += 1;
+                pid.push(q as u32);
+            }
         }
-        let mut ck: Vec<Ck> = Vec::with_capacity(parsed.iter().map(|p| p.ck[b].len()).sum());
+        let m = keys.len();
+        let mut acc = 0u32;
+        for o in ev_off.iter_mut() {
+            let c = *o;
+            *o = acc;
+            acc += c;
+        }
+        ev_off.push(acc);
+        let mut ev: Vec<PEv> = vec![PEv { person: 0, ts: 0, price: 0, cat: 0, kind: 0 }; n];
+        {
+            let mut fill: Vec<u32> = ev_off[..m].to_vec();
+            let mut k = 0;
+            for d in &deduped {
+                for e in &d.out[b] {
+                    let q = pid[k] as usize;
+                    k += 1;
+                    ev[fill[q] as usize] = *e;
+                    fill[q] += 1;
+                }
+            }
+        }
+        for q in 0..m {
+            let r = &mut ev[ev_off[q] as usize..ev_off[q + 1] as usize];
+            if r.len() > 1 {
+                r.sort_unstable_by_key(|e| e.ts);
+            }
+        }
+        // Clicks of persons with events, grouped the same way, each group by (ts, click_id).
+        let mut ck_off: Vec<u32> = vec![0; m + 1];
+        let mut ck_q: Vec<(u32, Ck)> = Vec::new();
         for p in &parsed {
-            ck.extend_from_slice(&p.ck[b]);
+            for c in &p.ck[b] {
+                if let Some(q) = local.get(c.person) {
+                    ck_off[q as usize] += 1;
+                    ck_q.push((q as u32, *c));
+                }
+            }
         }
-        ev.sort_unstable_by_key(|e| (e.person, e.ts));
-        ck.sort_unstable_by(|a, c| {
-            (a.person, a.ts).cmp(&(c.person, c.ts)).then_with(|| ids.cmp(a.cid, c.cid))
-        });
+        let mut acc = 0u32;
+        for o in ck_off.iter_mut() {
+            let c = *o;
+            *o = acc;
+            acc += c;
+        }
+        let mut ck: Vec<Ck> = vec![Ck { person: 0, ts: 0, cid: 0, camp: 0 }; ck_q.len()];
+        {
+            let mut fill: Vec<u32> = ck_off[..m].to_vec();
+            for (q, c) in &ck_q {
+                ck[fill[*q as usize] as usize] = *c;
+                fill[*q as usize] += 1;
+            }
+        }
+        for q in 0..m {
+            let r = &mut ck[ck_off[q] as usize..ck_off[q + 1] as usize];
+            if r.len() > 1 {
+                r.sort_unstable_by(|a, c| a.ts.cmp(&c.ts).then_with(|| ids.cmp(a.cid, c.cid)));
+            }
+        }
 
         let mut users = Vec::new();
         let mut camp = vec![[0u64; 4]; (ncamp + 1) * ndays];
@@ -518,21 +583,10 @@ fn main() {
         let mut run_end: Vec<usize> = Vec::new();
         let mut by_camp: Vec<(u32, i64)> = Vec::new();
 
-        let (mut i, mut c) = (0, 0);
-        while i < ev.len() {
-            let p = ev[i].person;
-            let mut e_end = i;
-            while e_end < ev.len() && ev[e_end].person == p {
-                e_end += 1;
-            }
-            while c < ck.len() && ck[c].person < p {
-                c += 1;
-            }
-            let cs = c;
-            while c < ck.len() && ck[c].person == p {
-                c += 1;
-            }
-            let cl = &ck[cs..c];
+        for q in 0..m {
+            let p = keys[q];
+            let (i, e_end) = (ev_off[q] as usize, ev_off[q + 1] as usize);
+            let cl = &ck[ck_off[q] as usize..ck_off[q + 1] as usize];
 
             starts.clear();
             sdays.clear();
@@ -646,7 +700,6 @@ fn main() {
                     }
                 }
             }
-            i = e_end;
         }
         Part { users, camp }
     });

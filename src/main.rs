@@ -133,15 +133,6 @@ fn csv_files(dir: &Path) -> Vec<PathBuf> {
 /// page faults cost more than parsing (measured 3.4 s per 1.6 GB single-threaded on macOS).
 struct Files {
     files: Vec<std::fs::File>,
-    /// Whole-file read-only mappings (Linux, READ=mmap): no copy; page cache pages are
-    /// mapped 16 at a time by fault-around. Never unmapped (exit reclaims them).
-    maps: Vec<(*const u8, usize)>,
-}
-
-unsafe impl Sync for Files {}
-
-unsafe extern "C" {
-    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
 }
 
 thread_local! {
@@ -151,22 +142,7 @@ thread_local! {
 impl Files {
     fn open(paths: &[PathBuf]) -> Self {
         let files: Vec<std::fs::File> = paths.iter().map(|p| std::fs::File::open(p).expect("open")).collect();
-        let mut maps = Vec::new();
-        if std::env::var("READ").as_deref() == Ok("mmap") {
-            use std::os::fd::AsRawFd;
-            for f in &files {
-                let len = f.metadata().expect("stat").len() as usize;
-                let p = if len == 0 {
-                    std::ptr::null()
-                } else {
-                    let p = unsafe { mmap(std::ptr::null_mut(), len, 1, 0x02, f.as_raw_fd(), 0) };
-                    assert!(p as isize != -1, "mmap failed");
-                    p as *const u8
-                };
-                maps.push((p, len));
-            }
-        }
-        Files { files, maps }
+        Files { files }
     }
 
     /// Offset just past the first '\n' at or after `from`, or the file length.
@@ -205,14 +181,11 @@ impl Files {
     /// Read a chunk into this thread's buffer and run `f` on it.
     fn with_chunk<R>(&self, c: (usize, u64, u64), f: impl FnOnce(&[u8]) -> R) -> R {
         use std::os::unix::fs::FileExt;
-        if let Some(&(p, len)) = self.maps.get(c.0) {
-            assert!(c.2 as usize <= len);
-            return f(unsafe { std::slice::from_raw_parts(p.add(c.1 as usize), (c.2 - c.1) as usize) });
-        }
         BUF.with_borrow_mut(|buf| {
             let n = (c.2 - c.1) as usize;
-            if buf.len() < n {
-                buf.resize(n, 0);
+            // +64: parsers may read up to 16 bytes past a field (pack_padded etc.)
+            if buf.len() < n + 64 {
+                buf.resize(n + 64, 0);
             }
             self.files[c.0].read_exact_at(&mut buf[..n], c.1).expect("read");
             f(&buf[..n])
@@ -415,8 +388,8 @@ fn main() {
                         if t < ws - REACH || t >= we {
                             return;
                         }
-                        let Some(camp) = campaigns.get(&f[2]) else { return };
-                        bk.push(Ck { person: ids.key(&f[1]), ts: t, cid: ids.key(&f[0]), camp }); // raw user ID
+                        let Some(camp) = (unsafe { campaigns.get_padded(&f[2]) }) else { return };
+                        bk.push(Ck { person: unsafe { ids.key_padded(&f[1]) }, ts: t, cid: unsafe { ids.key_padded(&f[0]) }, camp }); // raw user ID
                     });
                 })
             }
@@ -889,7 +862,8 @@ struct EvCtx<'a> {
 #[cfg_attr(feature = "prof", inline(never))]
 #[cfg_attr(not(feature = "prof"), inline(always))]
 fn event_rec(f: &scan::Line, c: &EvCtx) -> Ev {
-    let eid = c.ids.key(&f[0]);
+    // Safety: fields live in a with_chunk buffer, padded by 64 bytes.
+    let eid = unsafe { c.ids.key_padded(&f[0]) };
     let ingest_ms = ts::parse(&f[3]);
     let ingest = match ingest_ms {
         Some(x) => (x.div_euclid(1000) - c.ws_s + (1 << 31)).clamp(0, u32::MAX as i64 - 1) as u32,
@@ -897,10 +871,14 @@ fn event_rec(f: &scan::Line, c: &EvCtx) -> Ev {
     };
     let ingest_ms = ingest_ms.unwrap_or(i64::MAX);
     let t = ts::parse(&f[2]);
-    let kind = match &f[4] {
-        b"view" => VIEW,
-        b"cart" => CART,
-        b"purchase" => PURCHASE,
+    let k = &f[4];
+    let kind = match k.len() {
+        4 => match u32::from_le_bytes(k.try_into().unwrap()) {
+            x if x == u32::from_le_bytes(*b"view") => VIEW,
+            x if x == u32::from_le_bytes(*b"cart") => CART,
+            _ => u8::MAX,
+        },
+        8 if u64::from_le_bytes(k.try_into().unwrap()) == u64::from_le_bytes(*b"purchase") => PURCHASE,
         _ => u8::MAX,
     };
     let mut e = Ev { eid, person: 0, ingest, t: 0, pc: NOT_OK, _pad: 0 };
@@ -914,10 +892,10 @@ fn event_rec(f: &scan::Line, c: &EvCtx) -> Ev {
     {
         let p = if kind == PURCHASE { price(&f[6]) } else { Some(0) };
         if let Some(p) = p {
-            let cat = c.products.get(&f[5]).unwrap_or(c.unknown_cat) as u32;
+            let cat = unsafe { c.products.get_padded(&f[5]) }.unwrap_or(c.unknown_cat) as u32;
             e.pc = p | cat << 24;
             e.t = (t - c.ws) as u32;
-            e.person = c.ids.key(&f[1]);
+            e.person = unsafe { c.ids.key_padded(&f[1]) };
         }
     }
     e

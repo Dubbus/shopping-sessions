@@ -25,6 +25,43 @@ pub fn pack(b: &[u8]) -> Option<u64> {
     Some(k << (7 * (9 - b.len())))
 }
 
+/// `pack` for a field inside a buffer with at least 16 readable bytes from its start
+/// (the scanner's read buffers are padded). Same result as `pack`, without the byte loop.
+///
+/// # Safety
+/// `b.as_ptr()..b.as_ptr() + 16` must be readable.
+#[cfg_attr(feature = "prof", inline(never))]
+#[cfg_attr(not(feature = "prof"), inline(always))]
+pub unsafe fn pack_padded(b: &[u8]) -> Option<u64> {
+    let n = b.len();
+    if n == 0 || n > 9 {
+        return if n == 0 { Some(0) } else { None };
+    }
+    let p = b.as_ptr();
+    let raw = unsafe { std::ptr::read_unaligned(p as *const u64) };
+    let w = if n >= 8 { raw } else { raw & ((1u64 << (8 * n)) - 1) };
+    let b8 = if n == 9 { unsafe { *p.add(8) } } else { 0 };
+    // bytes 0..min(n,8) must be 0x01..=0x7f; byte 8 likewise when n == 9
+    let live = if n >= 8 { u64::MAX } else { (1u64 << (8 * n)) - 1 };
+    const LO7: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+    let zero = !(((w & LO7).wrapping_add(LO7)) | w | LO7) & 0x8080_8080_8080_8080;
+    if (w & 0x8080_8080_8080_8080) != 0 || (zero & live) != 0 || (n == 9 && (b8 == 0 || b8 >= 0x80)) {
+        return None;
+    }
+    let be = w.swap_bytes(); // byte 0 in the top 8 bits
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    let hi56 = unsafe { std::arch::x86_64::_pext_u64(be, LO7) };
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    let hi56 = {
+        let mut k = 0u64;
+        for i in (0..8).rev() {
+            k = (k << 7) | ((be >> (8 * i)) & 0x7f);
+        }
+        k
+    };
+    Some((hi56 << 7) | b8 as u64)
+}
+
 pub fn unpack(k: u64, out: &mut Vec<u8>) {
     for i in 0..9 {
         let c = ((k >> (7 * (8 - i))) & 0x7f) as u8;
@@ -47,6 +84,18 @@ impl Interner {
         match pack(b) {
             Some(k) => k,
             None => self.slow(b),
+        }
+    }
+
+    /// `key` for a field in a padded buffer (see `pack_padded`).
+    ///
+    /// # Safety
+    /// As `pack_padded`.
+    #[inline(always)]
+    pub unsafe fn key_padded(&self, b: &[u8]) -> u64 {
+        match unsafe { pack_padded(b) } {
+            Some(k) if !b.is_empty() => k,
+            _ => self.key(b),
         }
     }
 
@@ -108,6 +157,34 @@ fn canonical_number(rest: &[u8]) -> Option<usize> {
     Some(v)
 }
 
+/// `canonical_number` for `rest` inside a padded buffer: one load, SWAR digit check
+/// and conversion (up to 7 digits).
+///
+/// # Safety
+/// 8 bytes from `rest.as_ptr()` must be readable.
+#[inline(always)]
+unsafe fn canonical_number_padded(rest: &[u8]) -> Option<usize> {
+    let n = rest.len();
+    if n == 0 || n > 7 {
+        return None;
+    }
+    let raw = unsafe { std::ptr::read_unaligned(rest.as_ptr() as *const u64) };
+    let x = (raw ^ 0x3030_3030_3030_3030) & ((1u64 << (8 * n)) - 1);
+    // all n bytes are digits (bytes past n are 0 after the mask)
+    if ((x.wrapping_add(0x7676_7676_7676_7676) | x) & 0x8080_8080_8080_8080) != 0 {
+        return None;
+    }
+    if n > 1 && (x & 0xff) == 0 {
+        return None; // leading zero
+    }
+    // right-align the digits (first digit at byte 8-n), then the classic 8-digit SWAR fold
+    let mut v = x << (8 * (8 - n));
+    v = (v.wrapping_mul(10) + (v >> 8)) & 0x00ff_00ff_00ff_00ff;
+    v = (v.wrapping_mul(100) + (v >> 16)) & 0x0000_ffff_0000_ffff;
+    v = (v.wrapping_mul(10000) + (v >> 32)) & 0x0000_0000_ffff_ffff;
+    Some(v as usize)
+}
+
 impl<V: Copy> Lookup<V> {
     pub fn new() -> Self {
         Self { packed: FxMap::default(), other: FxMap::default(), dense: None, keys: Vec::new() }
@@ -152,6 +229,25 @@ impl<V: Copy> Lookup<V> {
             None => self.other.get(b).copied(),
         }
     }
+
+    /// `get` for a field inside a padded buffer.
+    ///
+    /// # Safety
+    /// 8 bytes past the end of `b` must be readable.
+    #[inline(always)]
+    pub unsafe fn get_padded(&self, b: &[u8]) -> Option<V> {
+        if let Some((prefix, table)) = &self.dense
+            && b.len() > prefix.len()
+            && b.starts_with(prefix)
+        {
+            let rest = &b[prefix.len()..];
+            return match unsafe { canonical_number_padded(rest) } {
+                Some(n) => table.get(n).copied().flatten(),
+                None => None,
+            };
+        }
+        self.get(b)
+    }
 }
 
 #[cfg(test)]
@@ -169,6 +265,32 @@ mod tests {
             assert_eq!(&v[..], *a);
         }
         assert!(pack(b"u123456789").is_none());
+    }
+
+    #[test]
+    fn padded_paths_match() {
+        let mut r: u64 = 7;
+        let alpha = b"0123456789abcdefuU \x00\xff\"p_c";
+        for _ in 0..300_000 {
+            r = r.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let n = (r >> 59) as usize % 12;
+            let mut buf = vec![0u8; 32];
+            for (i, b) in buf.iter_mut().enumerate() {
+                r = r.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                *b = if i < n || (r >> 60) & 1 == 1 { alpha[(r >> 33) as usize % alpha.len()] } else { b'z' };
+            }
+            let f = &buf[..n];
+            if n > 0 {
+                assert_eq!(unsafe { pack_padded(f) }, pack(f), "{f:?}");
+            }
+            assert_eq!(unsafe { canonical_number_padded(f) }, canonical_number(f), "{f:?}");
+        }
+        for v in [0usize, 1, 9, 10, 99, 100, 12345, 49999, 50000, 999_999, 9_999_999] {
+            let mut buf = v.to_string().into_bytes();
+            buf.extend_from_slice(&[b'9'; 16]);
+            let n = v.to_string().len();
+            assert_eq!(unsafe { canonical_number_padded(&buf[..n]) }, Some(v));
+        }
     }
 
     #[test]

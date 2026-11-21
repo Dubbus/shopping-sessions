@@ -1678,6 +1678,13 @@ def aggregation():
          ev("a7", "u1", T0 + D, typ="purchase", prod="p3", price=1))
     c.ck(ck("k1", "u1", "c_1", T0 + 2 * H))
 
+    c = case("agg_revenue_over_32_bits",
+             "One person, one day: 300 purchases at the maximum price (10,000,000 cents) in one session, so the day's revenue "
+             "(3,000,000,000) does not fit a signed 32-bit integer; a second person with a small purchase and a third with none",
+             R_REV)
+    c.ev(*[ev("big%03d" % i, "u1", T0 + i * S, typ="purchase", prod="p1", price=10_000_000) for i in range(300)])
+    c.ev(ev("s1", "u2", T0, typ="purchase", prod="p2", price=250), ev("s2", "u3", T0))
+
     c = case("agg_midnight_split",
              "Purchases after midnight belong to the session's start day for user_daily and for campaign_daily, while a new "
              "session after midnight belongs to the new day", R_DAY)

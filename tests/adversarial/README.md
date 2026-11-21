@@ -12,7 +12,7 @@ Unless a row says otherwise: window 2026-10-01 to 2026-10-15, products `p1` (sho
 
 The `big_*` inputs are large (about 170 MB together; the other cases about 15 MB) and are meant to be regenerated, not committed.
 
-## Cases (183)
+## Cases (184)
 
 | Case | What it contains | Rule sentence it targets |
 | --- | --- | --- |
@@ -156,6 +156,7 @@ The `big_*` inputs are large (about 170 MB together; the other cases about 15 MB
 | `click_organic_mix` | Organic and credited sessions on the same days, with purchases: `organic` rows carry sessions, purchasing sessions and revenue but 0 assists; credited + organic sums equal user_daily | No qualifying click credits the session to the campaign `organic` with the channel `organic`. |
 | `agg_top_category_ties` | top_category ties: `books`=`shoes` -> `books`; `Shoes`=`shoes` -> `Shoes`; `unknown`=`shoes` -> `shoes`; `unknown`=`zebra` -> `unknown`; `unknown` winning outright; `unknown`=`unknowm`; `unknown`=`v`; `UNKNOWN`=`unknown`; `unknown `=`unknown`; `z`=`é` -> `z`; a three-way tie; a tie made by several purchases summing equal | The category with the highest summed purchase `price_cents` in those sessions; a tie goes to the byte-wise smallest; null with no purchases. `unknown` competes like any category. |
 | `agg_revenue_across_sessions` | Revenue and top_category are summed over all sessions of a day: `shoes` leads the first session, `toys` the second, `books` wins the day; the next day's purchases are separate; views and carts carrying prices add nothing | Sum of `price_cents` over purchases in those sessions; 0 if none / The category with the highest summed purchase `price_cents` in those sessions; a tie goes to the byte-wise smallest; null with no purchases. `unknown` competes like any category. |
+| `agg_revenue_over_32_bits` | One person, one day: 300 purchases at the maximum price (10,000,000 cents) in one session, so the day's revenue (3,000,000,000) does not fit a signed 32-bit integer; a second person with a small purchase and a third with none | Sum of `price_cents` over purchases in those sessions; 0 if none |
 | `agg_midnight_split` | Purchases after midnight belong to the session's start day for user_daily and for campaign_daily, while a new session after midnight belongs to the new day | One day per session: the UTC date of its start. All its events and purchases count on that day, even those after midnight. |
 | `agg_odd_category_names` | Categories with odd names (`Unknown`, `null`, `None`, `NaN`, `123`, ` shoes`, `shoes `, `organic`, `true`, UTF-8, a 500-byte name, a date): one purchasing user per category | `products.csv`: `product_id,category`, clean, `product_id` unique / `campaigns.csv`: `campaign_id,channel`, clean, `campaign_id` unique, IDs like `c_123` |
 | `agg_products_spacing` | products.csv listing ` p1`, `p1 `, `P1`, `p 1`, `p1` (five products, five categories), a product ID with a tab, one with UTF-8, one that is `product_id`, one 300 bytes long; a purchase of each and of `p1  ` (unknown) | `products.csv`: `product_id,category`, clean, `product_id` unique / `campaigns.csv`: `campaign_id,channel`, clean, `campaign_id` unique, IDs like `c_123` / Spaces are part of a value, quoted or not: ` u1` and `" u1"` are one user, `u1 ` is another, and neither is `u1`. |

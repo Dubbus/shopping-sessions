@@ -787,6 +787,7 @@ fn main() {
         times[1] += t_sort - t_group;
         times[2] += t_clicks - t_sort;
         times[3] += t_end - t_clicks;
+        times[4] = times[4].max(t_end);
     });
     if std::env::var_os("STAGE_T").is_some() {
         let mut t = [0u64; 5];
@@ -795,7 +796,10 @@ fn main() {
                 t[k] += p.times[k];
             }
         }
-        eprintln!("sessions thread-ms: group {} sort {} clicks {} loop {}", t[0] / 1_000_000, t[1] / 1_000_000, t[2] / 1_000_000, t[3] / 1_000_000);
+        let slowest = parts.iter().map(|p| p.times[4]).max().unwrap_or(0);
+        eprintln!("sessions thread-ms: group {} sort {} clicks {} loop {}; slowest bucket {} ms, mean {} ms",
+            t[0] / 1_000_000, t[1] / 1_000_000, t[2] / 1_000_000, t[3] / 1_000_000,
+            slowest / 1_000_000, (t[0] + t[1] + t[2] + t[3]) / nb as u64 / 1_000_000);
     }
     lap("sessions");
     let parts: Vec<Part> = parts.into_iter().map(|s| Part { users: s.users, camp: s.camp }).collect();

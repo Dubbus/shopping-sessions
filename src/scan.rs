@@ -73,6 +73,22 @@ fn block_masks(b: &[u8; 64]) -> (u64, u64, u64) {
     }
 }
 
+/// The unquoted fields of one line, `line[j]`, built on use (no per-line slice array).
+pub struct Line<'s> {
+    base: *const u8,
+    lo: &'s [usize; 16],
+    hi: &'s [usize; 16],
+}
+
+impl std::ops::Index<usize> for Line<'_> {
+    type Output = [u8];
+    #[inline(always)]
+    fn index(&self, j: usize) -> &[u8] {
+        // lo/hi were set by the scanner for j < N, inside the buffer the caller holds
+        unsafe { std::slice::from_raw_parts(self.base.add(self.lo[j]), self.hi[j] - self.lo[j]) }
+    }
+}
+
 /// Calls `f` with the N unquoted fields of every well-formed line.
 ///
 /// Only commas and newlines are visited. Quotes are checked by counting: a line is
@@ -81,7 +97,7 @@ fn block_masks(b: &[u8; 64]) -> (u64, u64, u64) {
 /// Closing a field is branch-free (quoted fields are ~20%, at random: a branch on them
 /// mispredicts constantly on the scorer's Cascade Lake).
 #[inline(always)]
-pub fn for_each<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(buf: &'a [u8], mut f: F) {
+pub fn for_each<'a, const N: usize, F: FnMut(&Line)>(buf: &'a [u8], mut f: F) {
     let len = buf.len();
     // field bounds, slot N is a sink for lines with too many fields
     let mut lo = [0usize; 16];
@@ -135,8 +151,7 @@ pub fn for_each<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(buf: &'a [u8], mut
             close!(i);
             if unsafe { *base.add(i) } == b'\n' {
                 if bad == 0 && nf == N && line_q == 2 * quoted && i > line_start {
-                    let fields: [&'a [u8]; N] = std::array::from_fn(|j| unsafe { buf.get_unchecked(lo[j]..hi[j]) });
-                    f(&fields);
+                    f(&Line { base, lo: &lo, hi: &hi });
                 }
                 nf = 0;
                 quoted = 0;
@@ -153,8 +168,7 @@ pub fn for_each<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(buf: &'a [u8], mut
     if line_start < len {
         close!(len);
         if bad == 0 && nf == N && line_q == 2 * quoted {
-            let fields: [&'a [u8]; N] = std::array::from_fn(|j| &buf[lo[j]..hi[j]]);
-            f(&fields);
+            f(&Line { base, lo: &lo, hi: &hi });
         }
     }
 }
@@ -177,7 +191,7 @@ mod tests {
 
     fn fast<const N: usize>(buf: &[u8]) -> Vec<Vec<Vec<u8>>> {
         let mut out = Vec::new();
-        for_each::<N, _>(buf, |f| out.push(f.iter().map(|x| x.to_vec()).collect()));
+        for_each::<N, _>(buf, |f| out.push((0..N).map(|j| f[j].to_vec()).collect()));
         out
     }
 

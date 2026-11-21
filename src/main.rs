@@ -367,7 +367,7 @@ fn main() {
                 lk_files.with_chunk(lk_chunks[i], |chunk| {
                     scan::for_each::<2, _>(chunk, |f| {
                         if !f[0].is_empty() && !f[1].is_empty() {
-                            v.push((ids.key(f[0]), ids.key(f[1])));
+                            v.push((ids.key(&f[0]), ids.key(&f[1])));
                         }
                     });
                 });
@@ -411,12 +411,12 @@ fn main() {
                         if f[0].is_empty() || f[1].is_empty() {
                             return;
                         }
-                        let Some(t) = ts::parse(f[3]) else { return };
+                        let Some(t) = ts::parse(&f[3]) else { return };
                         if t < ws - REACH || t >= we {
                             return;
                         }
-                        let Some(camp) = campaigns.get(f[2]) else { return };
-                        bk.push(Ck { person: ids.key(f[1]), ts: t, cid: ids.key(f[0]), camp }); // raw user ID
+                        let Some(camp) = campaigns.get(&f[2]) else { return };
+                        bk.push(Ck { person: ids.key(&f[1]), ts: t, cid: ids.key(&f[0]), camp }); // raw user ID
                     });
                 })
             }
@@ -888,16 +888,16 @@ struct EvCtx<'a> {
 /// One event line (event_id known non-empty) to its record; validation per rules.md.
 #[cfg_attr(feature = "prof", inline(never))]
 #[cfg_attr(not(feature = "prof"), inline(always))]
-fn event_rec(f: &[&[u8]; 7], c: &EvCtx) -> Ev {
-    let eid = c.ids.key(f[0]);
-    let ingest_ms = ts::parse(f[3]);
+fn event_rec(f: &scan::Line, c: &EvCtx) -> Ev {
+    let eid = c.ids.key(&f[0]);
+    let ingest_ms = ts::parse(&f[3]);
     let ingest = match ingest_ms {
         Some(x) => (x.div_euclid(1000) - c.ws_s + (1 << 31)).clamp(0, u32::MAX as i64 - 1) as u32,
         None => u32::MAX,
     };
     let ingest_ms = ingest_ms.unwrap_or(i64::MAX);
-    let t = ts::parse(f[2]);
-    let kind = match f[4] {
+    let t = ts::parse(&f[2]);
+    let kind = match &f[4] {
         b"view" => VIEW,
         b"cart" => CART,
         b"purchase" => PURCHASE,
@@ -912,12 +912,12 @@ fn event_rec(f: &[&[u8]; 7], c: &EvCtx) -> Ev {
         && !f[5].is_empty()
         && ingest_ms - t <= LATE
     {
-        let p = if kind == PURCHASE { price(f[6]) } else { Some(0) };
+        let p = if kind == PURCHASE { price(&f[6]) } else { Some(0) };
         if let Some(p) = p {
-            let cat = c.products.get(f[5]).unwrap_or(c.unknown_cat) as u32;
+            let cat = c.products.get(&f[5]).unwrap_or(c.unknown_cat) as u32;
             e.pc = p | cat << 24;
             e.t = (t - c.ws) as u32;
-            e.person = c.ids.key(f[1]);
+            e.person = c.ids.key(&f[1]);
         }
     }
     e

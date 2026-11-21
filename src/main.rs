@@ -299,71 +299,10 @@ fn main() {
 
     let ids = Interner::default();
 
-    // ---- links: union-find, name = byte-wise smallest ID ----
+    // Links run as the first task of the parse stage, in parallel with event parsing:
+    // events keep raw user IDs until dedup, clicks until after parsing.
     let lk_files = Files::open(&csv_files(&data.join("links")));
-    let lk_chunks = lk_files.chunks(1 << 20);
-    let pairs: Vec<Vec<(u64, u64)>> = par(lk_chunks.len(), threads, |i| {
-        lk_files.with_chunk(lk_chunks[i], |chunk| {
-            let mut v = Vec::with_capacity(chunk.len() / 20);
-            scan::for_each::<2, _>(chunk, |f| {
-                if !f[0].is_empty() && !f[1].is_empty() {
-                    v.push((ids.key(f[0]), ids.key(f[1])));
-                }
-            });
-            v
-        })
-    });
-    let npairs: usize = pairs.iter().map(|v| v.len()).sum();
-    let mut node_of = Table::with_capacity(npairs + 16);
-    let mut parent: Vec<u32> = Vec::with_capacity(npairs + 16);
-    let mut node_key: Vec<u64> = Vec::with_capacity(npairs + 16);
-    fn find(parent: &mut [u32], mut x: u32) -> u32 {
-        while parent[x as usize] != x {
-            let p = parent[x as usize];
-            parent[x as usize] = parent[p as usize];
-            x = p;
-        }
-        x
-    }
-    for &(ka, kb) in pairs.iter().flatten() {
-        let mut node = |k: u64| -> u32 {
-            let next = parent.len() as u64;
-            let (v, new) = node_of.entry(k, next);
-            let v = *v as u32;
-            if new {
-                parent.push(v);
-                node_key.push(k);
-            }
-            v
-        };
-        let a = node(ka);
-        let b = node(kb);
-        let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
-        if ra != rb {
-            parent[ra as usize] = rb;
-        }
-    }
-    drop(pairs);
-    let nnodes = parent.len();
-    let mut root_name: Vec<u64> = vec![0; nnodes];
-    for n in 0..nnodes {
-        let r = find(&mut parent, n as u32) as usize;
-        let k = node_key[n];
-        if root_name[r] == 0 || ids.cmp(k, root_name[r]).is_lt() {
-            root_name[r] = k;
-        }
-    }
-    // Only IDs whose person is named by another ID need an entry; the rest map to themselves.
-    let mut person_of = Table::with_capacity(nnodes / 2 + 16);
-    for n in 0..nnodes {
-        let name = root_name[find(&mut parent, n as u32) as usize];
-        if name != node_key[n] {
-            person_of.entry(node_key[n], name);
-        }
-    }
-    drop((node_of, parent, node_key, root_name));
-    let person = |uid: u64| -> u64 { person_of.get(uid).unwrap_or(uid) };
-    lap("links");
+    let person_slot: std::sync::OnceLock<Table> = std::sync::OnceLock::new();
 
     // ---- parse events + clicks ----
     // Events go to many small event_id buckets so each dedup table stays cache-sized;
@@ -383,16 +322,22 @@ fn main() {
     let ck_cap = (ck_bytes / 40 / (threads * nb) as u64) as usize * 11 / 10 + 64;
     struct ParseState {
         ev: Vec<Vec<Ev>>,
-        ck: Vec<Vec<Ck>>,
+        ck: Vec<Ck>,
     }
     let parsed = workers(
-        nev + ck_chunks.len(),
+        1 + nev + ck_chunks.len(),
         threads,
         || ParseState {
             ev: (0..nbe).map(|_| Vec::with_capacity(ev_cap)).collect(),
-            ck: (0..nb).map(|_| Vec::with_capacity(ck_cap)).collect(),
+            ck: Vec::with_capacity(ck_cap * nb),
         },
         |st, i| {
+            if i == 0 {
+                let _ = person_slot.set(build_persons(&lk_files, &ids));
+                eprintln!("{:>8.3}s links done", t0.elapsed().as_secs_f64());
+                return;
+            }
+            let i = i - 1;
             if i < nev {
                 let bk = &mut st.ev;
                 ev_files.with_chunk(ev_chunks[i], |chunk| {
@@ -442,14 +387,15 @@ fn main() {
                             return;
                         }
                         let Some(camp) = campaigns.get(f[2]) else { return };
-                        let p = person(ids.key(f[1]));
-                        bk[bucket(p, nb)].push(Ck { person: p, ts: t, cid: ids.key(f[0]), camp });
+                        bk.push(Ck { person: ids.key(f[1]), ts: t, cid: ids.key(f[0]), camp }); // raw user ID
                     });
                 })
             }
         },
     );
     lap("parse");
+    let person_of = person_slot.into_inner().expect("links task ran");
+    let person = |uid: u64| -> u64 { person_of.get(uid).unwrap_or(uid) };
 
     // ---- dedup by event_id (smallest ingest_ts wins), resolve person, re-bucket ----
     let pev_cap = (ev_bytes / 70 / (threads * nb) as u64) as usize * 11 / 10 + 64;
@@ -457,16 +403,33 @@ fn main() {
         best: Table,
         dead: Vec<u64>,
         out: Vec<Vec<PEv>>,
+        ck: Vec<Vec<Ck>>,
     }
     let deduped = workers(
-        nbe,
+        threads + nbe,
         threads,
         || DedupState {
             best: Table::with_capacity(8),
             dead: Vec::new(),
             out: (0..nb).map(|_| Vec::with_capacity(pev_cap)).collect(),
+            ck: (0..nb).map(|_| Vec::new()).collect(),
         },
         |st, b| {
+            if b < threads {
+                // one worker's raw clicks: resolve person, bucket by person
+                let raw = &parsed[b].ck;
+                const AHEAD: usize = 16;
+                for i in 0..raw.len() {
+                    if i + AHEAD < raw.len() {
+                        person_of.prefetch(raw[i + AHEAD].person);
+                    }
+                    let mut c = raw[i];
+                    c.person = person(c.person);
+                    st.ck[bucket(c.person, nb)].push(c);
+                }
+                return;
+            }
+            let b = b - threads;
             let parts: Vec<&[Ev]> = parsed.iter().map(|p| &p.ev[b][..]).collect();
             let n: usize = parts.iter().map(|p| p.len()).sum();
             let best = &mut st.best;
@@ -572,7 +535,7 @@ fn main() {
         // Clicks of persons with events, grouped the same way, each group by (ts, click_id).
         let mut ck_off: Vec<u32> = vec![0; m + 1];
         let mut ck_q: Vec<(u32, Ck)> = Vec::new();
-        for p in &parsed {
+        for p in &deduped {
             for c in &p.ck[b] {
                 if let Some(q) = local.get(c.person) {
                     ck_off[q as usize] += 1;
@@ -736,6 +699,69 @@ fn main() {
     lap("done");
     // Skip freeing ~GBs of buffers and unmapping: the OS reclaims it all at exit.
     std::process::exit(0);
+}
+
+/// Union-find over the link files; the table maps an ID to its person's name (the
+/// byte-wise smallest ID) for every ID not named by itself.
+fn build_persons(lk_files: &Files, ids: &Interner) -> Table {
+    let mut pairs: Vec<(u64, u64)> = Vec::new();
+    for c in lk_files.chunks(1 << 24) {
+        lk_files.with_chunk(c, |chunk| {
+            scan::for_each::<2, _>(chunk, |f| {
+                if !f[0].is_empty() && !f[1].is_empty() {
+                    pairs.push((ids.key(f[0]), ids.key(f[1])));
+                }
+            });
+        });
+    }
+    let npairs = pairs.len();
+    let mut node_of = Table::with_capacity(npairs + 16);
+    let mut parent: Vec<u32> = Vec::with_capacity(npairs + 16);
+    let mut node_key: Vec<u64> = Vec::with_capacity(npairs + 16);
+    fn find(parent: &mut [u32], mut x: u32) -> u32 {
+        while parent[x as usize] != x {
+            let p = parent[x as usize];
+            parent[x as usize] = parent[p as usize];
+            x = p;
+        }
+        x
+    }
+    for &(ka, kb) in &pairs {
+        let mut node = |k: u64| -> u32 {
+            let next = parent.len() as u64;
+            let (v, new) = node_of.entry(k, next);
+            let v = *v as u32;
+            if new {
+                parent.push(v);
+                node_key.push(k);
+            }
+            v
+        };
+        let a = node(ka);
+        let b = node(kb);
+        let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
+        if ra != rb {
+            parent[ra as usize] = rb;
+        }
+    }
+    let nnodes = parent.len();
+    let mut root_name: Vec<u64> = vec![0; nnodes];
+    for n in 0..nnodes {
+        let r = find(&mut parent, n as u32) as usize;
+        let k = node_key[n];
+        if root_name[r] == 0 || ids.cmp(k, root_name[r]).is_lt() {
+            root_name[r] = k;
+        }
+    }
+    // Only IDs whose person is named by another ID need an entry; the rest map to themselves.
+    let mut person_of = Table::with_capacity(nnodes / 2 + 16);
+    for n in 0..nnodes {
+        let name = root_name[find(&mut parent, n as u32) as usize];
+        if name != node_key[n] {
+            person_of.entry(node_key[n], name);
+        }
+    }
+    person_of
 }
 
 /// Close a user-day: top category = highest summed price, tie -> smallest (sorted) name.

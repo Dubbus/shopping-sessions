@@ -302,8 +302,9 @@ fn main() {
     let nb = threads * 8;
     let ev_files = Files::open(&csv_files(&data.join("events")));
     let ck_files = Files::open(&csv_files(&data.join("clicks")));
-    let ev_chunks = ev_files.chunks(4 << 20);
-    let ck_chunks = ck_files.chunks(4 << 20);
+    let chunk_kb: u64 = std::env::var("CHUNK_KB").ok().and_then(|v| v.parse().ok()).unwrap_or(512); // fits a Cascade Lake 1 MiB L2
+    let ev_chunks = ev_files.chunks(chunk_kb << 10);
+    let ck_chunks = ck_files.chunks(chunk_kb << 10);
     let nev = ev_chunks.len();
 
     let ev_bytes: u64 = ev_chunks.iter().map(|c| c.2 - c.1).sum();

@@ -14,6 +14,7 @@
 //!   4. write     Parquet, one user_daily file per thread
 
 mod csv;
+mod dense;
 mod io;
 mod key;
 mod link;
@@ -510,9 +511,11 @@ fn main() -> Res<()> {
         id
     };
     let mut products = StrMap::default();
+    let mut product_pairs: Vec<(Str, u32)> = Vec::new();
     for (product, category) in pairs(read_static(&data_dir.join("products.csv"))?) {
         let category = category_id(category);
-        products.get_or_insert(product, category);
+        let category = products.get_or_insert(product, category);
+        product_pairs.push((product, category));
     }
     let unknown_category = category_id(b"unknown");
 
@@ -529,6 +532,29 @@ fn main() -> Res<()> {
     let organic = campaign_names.len();
     campaign_names.push(b"organic");
     channels.push(b"organic");
+
+    // The numbered path first; it gives up before writing anything when the input is not
+    // numbered the way it expects, and then everything below does the job.
+    if std::env::var("SS_DENSE").map_or(true, |v| v != "0") {
+        let inputs = dense::Inputs {
+            data_dir: &data_dir,
+            out_dir: &out_dir,
+            threads,
+            window_start,
+            window_end,
+            products: &product_pairs,
+            unknown_category,
+            category_names: &category_names,
+            campaigns: &campaigns,
+            campaign_names: &campaign_names,
+            channels: &channels,
+            organic,
+        };
+        if dense::run(&inputs)? {
+            std::process::exit(0);
+        }
+        log("dense gave up");
+    }
 
     // Tuning knobs, for benchmarking only: unset, each takes the default chosen below.
     let knob = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok());

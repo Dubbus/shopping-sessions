@@ -73,16 +73,42 @@ fn block_masks(b: &[u8; 64]) -> (u64, u64, u64) {
 /// Only commas and newlines are visited. Quotes are checked by counting: a line is
 /// well-formed iff every field starting with '"' also ends with '"' (length >= 2) and the
 /// line holds exactly two quotes per such field, so no quote can sit anywhere else.
+/// Closing a field is branch-free (quoted fields are ~20%, at random: a branch on them
+/// mispredicts constantly on the scorer's Cascade Lake).
 #[inline(always)]
 pub fn for_each<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(buf: &'a [u8], mut f: F) {
     let len = buf.len();
-    let mut fields: [&'a [u8]; N] = [&[]; N];
-    let mut nf = 0usize; // fields seen on this line (may exceed N)
+    // field bounds, slot N is a sink for lines with too many fields
+    let mut lo = [0usize; 16];
+    let mut hi = [0usize; 16];
+    assert!(N < 16);
+    let mut nf = 0usize;
     let mut fstart = 0usize;
-    let mut quoted = 0u32; // fields on this line that start and end with '"'
-    let mut bad = false;
-    let mut line_q = 0u32; // quotes on this line so far
+    let mut quoted = 0u32;
+    let mut bad = 0u32;
+    let mut line_q = 0u32;
     let mut line_start = 0usize;
+    let base = buf.as_ptr();
+
+    // close field [fstart, end): branch-free
+    macro_rules! close {
+        ($end:expr) => {{
+            let end: usize = $end;
+            let flen = end - fstart;
+            // first and last byte; when flen < 2 these are masked out below
+            let first = unsafe { *base.add(fstart.min(len - 1)) };
+            let last = unsafe { *base.add(end.saturating_sub(1)) };
+            let qs = (first == b'"') as usize & (flen >= 1) as usize;
+            let qe = (last == b'"') as usize & (flen >= 2) as usize;
+            bad |= (qs & !qe & 1) as u32;
+            quoted += qs as u32;
+            let k = nf.min(N);
+            lo[k] = fstart + qs;
+            hi[k] = (end - qs).max(fstart + qs);
+            nf += 1;
+            fstart = end + 1;
+        }};
+    }
 
     let mut pos = 0usize;
     while pos < len {
@@ -91,42 +117,25 @@ pub fn for_each<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(buf: &'a [u8], mut
         } else {
             let mut t = [0u8; 64];
             t[..len - pos].copy_from_slice(&buf[pos..]);
-            let (s, n, q) = block_masks(&t);
-            (s, n, q)
+            block_masks(&t)
         };
-        // quotes in this block before bit `from` are already counted
         let mut from = 0u32;
         while m != 0 {
             let bit = m.trailing_zeros();
             m &= m - 1;
             let i = pos + bit as usize;
-            // quotes between the previous separator in this block and this one
-            let below = if bit == 0 { 0 } else { q & (u64::MAX >> (64 - bit)) };
+            let below = q & !(u64::MAX << bit); // quotes before this separator in the block
             line_q += (below >> from).count_ones();
             from = bit + 1;
-            // close field [fstart, i)
-            let fld = unsafe { buf.get_unchecked(fstart..i) };
-            if nf < N {
-                if fld.first() == Some(&b'"') {
-                    if fld.len() >= 2 && fld[fld.len() - 1] == b'"' {
-                        fields[nf] = &fld[1..fld.len() - 1];
-                        quoted += 1;
-                    } else {
-                        bad = true;
-                    }
-                } else {
-                    fields[nf] = fld;
-                }
-            }
-            nf += 1;
-            fstart = i + 1;
-            if unsafe { *buf.get_unchecked(i) } == b'\n' {
-                if !bad && nf == N && line_q == 2 * quoted && i > line_start {
+            close!(i);
+            if unsafe { *base.add(i) } == b'\n' {
+                if bad == 0 && nf == N && line_q == 2 * quoted && i > line_start {
+                    let fields: [&'a [u8]; N] = std::array::from_fn(|j| unsafe { buf.get_unchecked(lo[j]..hi[j]) });
                     f(&fields);
                 }
                 nf = 0;
                 quoted = 0;
-                bad = false;
+                bad = 0;
                 line_q = 0;
                 line_start = i + 1;
             }
@@ -137,21 +146,9 @@ pub fn for_each<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(buf: &'a [u8], mut
         pos += 64;
     }
     if line_start < len {
-        let fld = &buf[fstart..len];
-        if nf < N {
-            if fld.first() == Some(&b'"') {
-                if fld.len() >= 2 && fld[fld.len() - 1] == b'"' {
-                    fields[nf] = &fld[1..fld.len() - 1];
-                    quoted += 1;
-                } else {
-                    bad = true;
-                }
-            } else {
-                fields[nf] = fld;
-            }
-        }
-        nf += 1;
-        if !bad && nf == N && line_q == 2 * quoted {
+        close!(len);
+        if bad == 0 && nf == N && line_q == 2 * quoted {
+            let fields: [&'a [u8]; N] = std::array::from_fn(|j| &buf[lo[j]..hi[j]]);
             f(&fields);
         }
     }

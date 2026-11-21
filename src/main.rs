@@ -320,6 +320,8 @@ fn main() {
         ev: Vec<Vec<Ev>>,
         ck: Vec<Ck>,
     }
+    // ABL (benchmarking only): 1 = scan events but skip field work, 2 = skip the bucket store
+    let abl: u32 = std::env::var("ABL").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     let ectx = EvCtx { ids: &ids, products: &products, unknown_cat, ws, we, ws_s };
     // Items: link chunks, then the union-find (waits for them), then events, then clicks.
     let parsed = workers(
@@ -357,10 +359,14 @@ fn main() {
                 let bk = &mut st.ev;
                 ev_files.with_chunk(ev_chunks[i], |chunk| {
                     scan::for_each::<7, _>(chunk, |f| {
-                        if f[0].is_empty() {
+                        if f[0].is_empty() || abl == 1 {
                             return;
                         }
                         let e = event_rec(f, &ectx);
+                        if abl == 2 {
+                            std::hint::black_box(e);
+                            return;
+                        }
                         push_ev(&mut bk[bucket(e.eid, nbe)], e);
                     });
                 })
@@ -383,6 +389,9 @@ fn main() {
         },
     );
     lap("parse");
+    if abl != 0 {
+        std::process::exit(0);
+    }
     let person_of = person_slot.into_inner().expect("links task ran");
     let person = |uid: u64| -> u64 { person_of.get(uid).unwrap_or(uid) };
 

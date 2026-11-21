@@ -311,3 +311,10 @@ the amount of scalar work per row.
 then convert each column with AVX-512 eight lanes at a time: `ingest_ts` (always F1), `ts` split
 into per-format lists, then IDs and the partition push. Target: the 1.95G cycles of field
 conversion down by about half.
+
+**Result: columnar timestamps lose.** Built and verified (AVX-512 lanes equal `ts::parse` on every
+byte value in every position): `ingest_ts` and `ts` converted 8 at a time with gathers, per form.
+`ss-pmu`: 12.6G cycles vs 12.06G row at a time. `ss-bench`: 1.21 s vs 1.14 s. Gathers are slow on
+Cascade Lake and the batching costs more than it saves; the date cache already makes the scalar
+path cheap. Dropped. (A bug found on the way: 20- and 25-character all-digit values are F3, so
+the form must be decided by `b[4] == '-'`, not the length.)

@@ -67,3 +67,22 @@ Container on ss-bench (Cascade Lake, scorer flags, 20M): 1.33-1.35 s median. 60M
 - 08:00 queue 5, partitions (4 rounds, 20M, total ms): default (event 10 bits) 1145-1152 (+1 outlier); event 9: 1134-1149, every round better (parse -12 ms); event 11: 1158-1296; person 8: 1156-1180; person 10: 1155-1170. 60M: event 12 (default) 3.67-3.94 s vs 11: 3.53-3.62 s.
 - 08:05 kept: event partitions sized for 64k events (rule, so it scales: 9 bits at 20M, 11 at 60M). Verified, committed 2f45fb1, pushed.
 - 08:07 sweep 3 (seeds 300-339 on 85dd944): 40/40 agree. Sweep 4 started on 2f45fb1 (seeds 400-429, ~/sweep4.log).
+
+## Branch `dense` (2026-11-21, evening)
+
+- **Numbered path** (`pipeline/src/dense.rs`, written from the generator source, not from any
+  other entry): event/click/user IDs are base36 of `scramble(number, key)` with per-dataset
+  keys; keys found from a sample (most used user = whale alias 0; whale rows' event/click
+  numbers are small, brute force over that range). Events placed by number into 16k-slot
+  partitions (dedup = smallest ingest per slot), read in slot order = each person's events
+  grouped and time-sorted, sessionized on the spot; people at partition edges stitched;
+  kiosks, split people, odd IDs take an exact slow path by name; any broken assumption gives
+  up before writing and the ordinary pipeline runs (`SS_DENSE=0` forces that).
+- Gate: 30 unit tests (randomized cut vs csv::split, AVX-512 decode8 vs scalar), fixtures
+  36/36, adversarial 169/172 (3 known), dev MATCH, 20M MATCH vs master, rig dev+20M MATCH.
+- ss-bench native 20M: 671 ms (keys 16, parse 407, people 27, clicks 40, events 125,
+  stitch 20, write 34) vs 817 ms ordinary; container median 0.842 s (was 1.008) -> board ~0.79.
+- Per event line (ss-pmu, 1 thread): cut 183 instr / 68 cycles, ID decode + ingest 176 / 43,
+  ts + validity 186 / 52. A 0.30 s board needs ~70 cycles per line in total.
+- Tried and dropped: chained lines (newline from each line's own second window, no newline
+  pass): parse 407 -> 444 ms.

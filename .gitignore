@@ -11,3 +11,4 @@ perf.data*
 /dev-answer
 /spec
 !fixtures/**/*.csv
+/.venv

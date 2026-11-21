@@ -1,5 +1,28 @@
 # Night log (branch `perf`)
 
+## Morning summary (2026-11-21, 08:45)
+
+**Submit `2f45fb1317c24bf89fd7406d7914a7197f98a5b2`** (branch `perf`; later commits only add this log).
+
+- **Verified:** 169/172 fixtures + adversarial (the 3 known >42-day windows), dev answer MATCH,
+  20M output identical to master's independent implementation; 60M output identical too
+  (checked on 85dd944; 2f45fb1 changes partition counts only and passes the same gate).
+- **Reference sweeps** (pipeline vs both Python references, 300k events per seed): 150/150 seeds
+  agree - seeds 100-139 and 200-239 on 5a2c260, 300-339 on 85dd944, 400-429 on 2f45fb1.
+- **Speed:** container median on ss-bench 1.334 s at the end vs 1.319-1.351 s at the start, but
+  the rig drifted by +-4% through the night, so compare the interleaved A/Bs instead. Kept:
+  event files read through a mapping instead of `pread` (-1.8%, 246d003), dedup output reusing
+  finished event blocks (-1.4%, 85dd944), event partitions sized for 64k events (~-1% at 20M,
+  -3% at 60M, 2f45fb1). Together about -4% against clean-slate 12ad3e6.
+- **Dropped (measured, no win):** dedup bitmap 4/16 bits per event, thread counts other than 8,
+  chunk sizes other than 512 KB, person partition count +-1 (plus, earlier: columnar AVX-512
+  timestamps, branch-free timestamps, MADV_POPULATE_READ, thread pinning, plain stores, no AVX-512).
+- **clean-slate merged:** 8b8545e and 12ad3e6 (merged before the loop started, ef56846); no
+  new clean-slate commits appeared overnight.
+- **60M safety:** about 3.5-3.6 s native warm, peak RSS ~11 GB (mapped input included) of 24 GB.
+- VMs stopped; overnight loop cancelled.
+
+
 Hourly loop: merge new `clean-slate` commits into `perf` -> `scripts/verify.sh` -> push only if it
 passes -> `scripts/rig_docker.sh 5` -> one experiment from the queue (A/B on ss-bench with
 alternating runs, kept only on a measured win) -> a line here.

@@ -96,6 +96,12 @@ pub fn id_copy(s: &[u8]) -> Id {
     unsafe { id(&padded[..s.len()]) }
 }
 
+/// Whether the ID is one of the rare interned ones, whose key does not order like its bytes.
+#[inline]
+pub fn is_interned(id: Id) -> bool {
+    id & INTERNED != 0
+}
+
 /// Appends the ID's bytes to `out`.
 #[inline]
 pub fn write_bytes(id: Id, out: &mut Vec<u8>) {

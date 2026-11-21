@@ -83,19 +83,28 @@ struct Click {
     campaign: u32,
 }
 
-/// An event grouped under its person, ready to be put in time order.
-#[derive(Clone, Copy, Default)]
-struct PersonEvent {
-    ts: u32,
-    price: u32,
-    category: u32,
+// Inside a person partition, events and clicks are single integers, so that putting them
+// in order is a plain integer sort.
+//
+// An event is `ts << 32 | purchase`, where `purchase` is 0 or one more than the index of
+// its (price, category) in the partition's purchase list.
+//
+// A click is `ts << 96 | !id << 32 | campaign`: ascending order is by time, then by
+// click_id descending, which is the order the credit rule wants (see the sessions stage).
+
+#[inline]
+fn click_key(ts: u32, id: Id, campaign: u32) -> u128 {
+    (ts as u128) << 96 | (!id as u128) << 32 | campaign as u128
 }
 
-#[derive(Clone, Copy, Default)]
-struct PersonClick {
-    ts: u32,
-    campaign: u32,
-    id: Id,
+#[inline]
+fn click_ts(key: u128) -> u32 {
+    (key >> 96) as u32
+}
+
+#[inline]
+fn click_id(key: u128) -> Id {
+    !((key >> 32) as u64)
 }
 
 /// Everything the parse stage reads but never changes.
@@ -408,8 +417,10 @@ struct Sessions {
     /// Where each person's events (and clicks) start in the grouped arrays; one extra entry at the end.
     event_start: Vec<u32>,
     click_start: Vec<u32>,
-    events: Vec<PersonEvent>,
-    clicks: Vec<PersonClick>,
+    events: Vec<u64>,
+    clicks: Vec<u128>,
+    /// (price, category) of the partition's purchases.
+    purchases: Vec<(u32, u32)>,
     /// Clicks per campaign inside the current 7-day window, and the campaigns present.
     in_window: Vec<u32>,
     slot: Vec<u32>,
@@ -731,6 +742,7 @@ fn main() -> Res<()> {
             click_start: Vec::new(),
             events: Vec::new(),
             clicks: Vec::new(),
+            purchases: Vec::new(),
             in_window: vec![0; campaign_count],
             slot: vec![0; campaign_count],
             active: Vec::new(),
@@ -765,15 +777,22 @@ fn main() -> Res<()> {
             // Group the events by person, then put each person's in time order (events step 5).
             offsets(&mut s.event_start);
             s.events.clear();
-            s.events.resize(s.owner.len(), PersonEvent::default());
+            s.events.resize(s.owner.len(), 0);
+            s.purchases.clear();
             for (event, &person) in survivors.iter().flat_map(|thread| thread.slices(part)).flatten().zip(&s.owner) {
+                let purchase = if event.price != 0 {
+                    s.purchases.push((event.price, event.category));
+                    s.purchases.len() as u64
+                } else {
+                    0
+                };
                 let at = &mut s.event_start[person as usize + 1];
-                s.events[*at as usize] = PersonEvent { ts: event.ts, price: event.price, category: event.category };
+                s.events[*at as usize] = (event.ts as u64) << 32 | purchase;
                 *at += 1;
             }
             // Each start slid one person along while filling; entry p is again where p begins.
             for person in 0..people {
-                s.events[s.event_start[person] as usize..s.event_start[person + 1] as usize].sort_unstable_by_key(|e| e.ts);
+                s.events[s.event_start[person] as usize..s.event_start[person + 1] as usize].sort_unstable();
             }
 
             // The same for clicks. A person with no surviving events has no sessions to credit.
@@ -790,11 +809,15 @@ fn main() -> Res<()> {
             let kept: u32 = s.click_start.iter().sum();
             offsets(&mut s.click_start);
             s.clicks.clear();
-            s.clicks.resize(kept as usize, PersonClick::default());
+            s.clicks.resize(kept as usize, 0);
+            // An interned click ID does not order like its bytes, so a partition holding
+            // one sorts its clicks with the exact comparison instead.
+            let mut odd_ids = false;
             for (click, &person) in clicks.iter().flat_map(|thread| thread.slices(part)).flatten().zip(&s.owner) {
                 if person != u32::MAX {
+                    odd_ids |= key::is_interned(click.id);
                     let at = &mut s.click_start[person as usize + 1];
-                    s.clicks[*at as usize] = PersonClick { ts: click.ts, campaign: click.campaign, id: click.id };
+                    s.clicks[*at as usize] = click_key(click.ts, click.id, click.campaign);
                     *at += 1;
                 }
             }
@@ -804,7 +827,11 @@ fn main() -> Res<()> {
                 let clicks = &mut s.clicks[s.click_start[person] as usize..s.click_start[person + 1] as usize];
                 // Within one millisecond the smallest click_id goes last, so "the last click at or
                 // before the session start" is the one the tie rule picks.
-                clicks.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| key::cmp_bytes(b.id, a.id)));
+                if odd_ids {
+                    clicks.sort_unstable_by(|&a, &b| click_ts(a).cmp(&click_ts(b)).then_with(|| key::cmp_bytes(click_id(b), click_id(a))));
+                } else {
+                    clicks.sort_unstable();
+                }
                 let clicks = &*clicks;
                 // The window of clicks within 7 days before the session start is clicks[lo..hi].
                 let (mut lo, mut hi) = (0, 0);
@@ -832,7 +859,7 @@ fn main() -> Res<()> {
                 let mut i = 0;
                 while i < events.len() {
                     // One session: events up to the first gap over 30 minutes.
-                    let start = events[i].ts;
+                    let start = (events[i] >> 32) as u32;
                     // Step 6: the session's day is the UTC date of its start.
                     let day = (base + start as i64).div_euclid(DAY_MS);
                     if day != row_day {
@@ -842,17 +869,19 @@ fn main() -> Res<()> {
                     let mut previous = start;
                     let (mut count, mut revenue) = (0i64, 0u64);
                     while i < events.len() {
-                        let event = events[i];
-                        if event.ts - previous > GAP_MS {
+                        let ts = (events[i] >> 32) as u32;
+                        if ts - previous > GAP_MS {
                             break;
                         }
-                        previous = event.ts;
+                        previous = ts;
                         count += 1;
-                        if event.price != 0 {
-                            revenue += event.price as u64;
-                            match s.day_categories.iter_mut().find(|c| c.0 == event.category) {
-                                Some(c) => c.1 += event.price as u64,
-                                None => s.day_categories.push((event.category, event.price as u64)),
+                        let purchase = events[i] as u32;
+                        if purchase != 0 {
+                            let (price, category) = s.purchases[purchase as usize - 1];
+                            revenue += price as u64;
+                            match s.day_categories.iter_mut().find(|c| c.0 == category) {
+                                Some(c) => c.1 += price as u64,
+                                None => s.day_categories.push((category, price as u64)),
                             }
                         }
                         i += 1;
@@ -862,11 +891,11 @@ fn main() -> Res<()> {
                     row_revenue += revenue as i64;
 
                     // Clicks steps 4 to 7. Slide the window to this session's start.
-                    while hi < clicks.len() && clicks[hi].ts <= start {
+                    while hi < clicks.len() && click_ts(clicks[hi]) <= start {
                         // Clicks step 2: copies of a click are identical, so they are neighbours
-                        // here, and only the first of them counts.
-                        if hi == 0 || clicks[hi].ts != clicks[hi - 1].ts || clicks[hi].id != clicks[hi - 1].id {
-                            let c = clicks[hi].campaign as usize;
+                        // here (same time and ID), and only the first of them counts.
+                        if hi == 0 || clicks[hi] >> 32 != clicks[hi - 1] >> 32 {
+                            let c = clicks[hi] as u32 as usize;
                             if s.in_window[c] == 0 {
                                 s.slot[c] = s.active.len() as u32;
                                 s.active.push(c as u32);
@@ -875,9 +904,9 @@ fn main() -> Res<()> {
                         }
                         hi += 1;
                     }
-                    while lo < hi && (start - clicks[lo].ts) as i64 > WEEK_MS {
-                        if lo == 0 || clicks[lo].ts != clicks[lo - 1].ts || clicks[lo].id != clicks[lo - 1].id {
-                            let c = clicks[lo].campaign as usize;
+                    while lo < hi && (start - click_ts(clicks[lo])) as i64 > WEEK_MS {
+                        if lo == 0 || clicks[lo] >> 32 != clicks[lo - 1] >> 32 {
+                            let c = clicks[lo] as u32 as usize;
                             s.in_window[c] -= 1;
                             if s.in_window[c] == 0 {
                                 let at = s.slot[c] as usize;
@@ -890,7 +919,7 @@ fn main() -> Res<()> {
                         }
                         lo += 1;
                     }
-                    let credited = if hi > lo { clicks[hi - 1].campaign as usize } else { organic };
+                    let credited = if hi > lo { clicks[hi - 1] as u32 as usize } else { organic };
                     let day_index = (day - first_day) as usize;
                     let cell = &mut s.campaign_days[credited * days + day_index];
                     cell[0] += 1;

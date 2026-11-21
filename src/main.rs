@@ -7,6 +7,7 @@
 //!   5. Parquet out
 //! Logs go to stderr only.
 
+mod alloc;
 mod csv;
 mod ids;
 mod parquet;
@@ -18,6 +19,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering as AO};
 use std::time::Instant;
+
+#[global_allocator]
+static GLOBAL: alloc::Alloc = alloc::Alloc;
 
 use ids::{Interner, Lookup};
 use table::Table;

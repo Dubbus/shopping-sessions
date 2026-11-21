@@ -13,8 +13,10 @@ SSH=(ssh -i "$HOME/.ssh/google_compute_engine" -o "UserKnownHostsFile=$HOME/.ssh
 case "${1:?usage: cloud.sh ssh|sync|start|stop|status|delete}" in
   ssh) shift; "${SSH[@]}" "$USER@$(ip)" "$@" ;;
   sync)
+    # SYNC_SKIP: one more path to leave alone there (for a file someone else is mid-edit on).
     rsync -az --delete -e "${SSH[*]}" --exclude .git --exclude .venv --exclude target/ --exclude data/ \
-      --exclude out/ --exclude .DS_Store --exclude __pycache__ "$ROOT/" "$USER@$(ip):shopping-sessions/" ;;
+      --exclude out/ --exclude .DS_Store --exclude __pycache__ ${SYNC_SKIP:+--exclude "$SYNC_SKIP"} \
+      "$ROOT/" "$USER@$(ip):shopping-sessions/" ;;
   start) gcloud compute instances start "$NAME" --zone "$ZONE" ;;
   stop) gcloud compute instances stop "$NAME" --zone "$ZONE" ;;
   status) gcloud compute instances describe "$NAME" --zone "$ZONE" --format='value(status,lastStartTimestamp)' ;;

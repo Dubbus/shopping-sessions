@@ -1,9 +1,11 @@
 //! Parquet output for the two tables, written by hand.
 //!
 //! Every column is dictionary-encoded: a dictionary page of the distinct values,
-//! then one data page of indexes in the RLE / bit-packed hybrid. Pages are
-//! uncompressed version-1 data pages, which every reader understands. Small
-//! files matter: Docker returns only once the output has reached the disk.
+//! then one data page of indexes in the RLE / bit-packed hybrid. The one exception is
+//! `revenue_cents` of `user_daily`, where most rows hold the same value 0: its zeros are a
+//! dictionary-encoded page and its other values a PLAIN page. Pages are uncompressed
+//! version-1 data pages, which every reader understands. Small files matter: Docker returns
+//! only once the output has reached the disk.
 //!
 //! Layout: `PAR1`, the column chunks, the footer (Thrift compact protocol), its
 //! length, `PAR1`.
@@ -158,13 +160,35 @@ struct Column {
     optional: bool,
 }
 
-/// One column's pages, ready to be placed in the file.
-struct Chunk {
-    dictionary: Vec<u8>,
-    dictionary_len: usize,
-    /// Definition levels (for an optional column) followed by the index run data.
+/// A dictionary page: the entries and how many there are.
+struct Dictionary {
+    bytes: Vec<u8>,
+    entries: usize,
+}
+
+/// A data page of `values` values.
+struct Page {
+    encoding: i32,
+    /// Definition levels (for an optional column) followed by the values or index run data.
     data: Vec<u8>,
     values: usize,
+}
+
+/// One column's pages, ready to be placed in the file: an optional dictionary page, then
+/// data pages.
+struct Chunk {
+    dictionary: Option<Dictionary>,
+    pages: Vec<Page>,
+}
+
+impl Chunk {
+    /// A dictionary page followed by one page of indexes into it.
+    fn dictionary_encoded(bytes: Vec<u8>, entries: usize, data: Vec<u8>, values: usize) -> Chunk {
+        Chunk {
+            dictionary: Some(Dictionary { bytes, entries }),
+            pages: vec![Page { encoding: RLE_DICTIONARY, data, values }],
+        }
+    }
 }
 
 // ---- The RLE / bit-packed hybrid ---------------------------------------------------------
@@ -341,7 +365,7 @@ fn int_chunk(values: impl Iterator<Item = i64>, bytes: usize) -> Chunk {
         hybrid.push(index);
     }
     hybrid.finish();
-    Chunk { dictionary, dictionary_len: distinct as usize, data, values: indexes.len() }
+    Chunk::dictionary_encoded(dictionary, distinct as usize, data, indexes.len())
 }
 
 /// A string column given as indexes into `names`; `absent` marks a null.
@@ -379,44 +403,105 @@ fn name_chunk(indexes: &[u32], names: &[Str], absent: Option<u32>) -> Chunk {
         }
     }
     hybrid.finish();
-    Chunk { dictionary, dictionary_len: distinct as usize, data, values: indexes.len() }
+    Chunk::dictionary_encoded(dictionary, distinct as usize, data, indexes.len())
 }
 
-/// The ID column of `user_daily`. A person's rows are consecutive, so each stretch of equal
-/// IDs is one dictionary entry and one run.
+/// The ID column of `user_daily`. A person's rows are consecutive within each of the two
+/// groups the writer orders them in, so each stretch of equal IDs is one run. A person who
+/// has rows in both groups has two runs that point at the same dictionary entry.
 fn id_chunk(ids: &[Id]) -> Chunk {
+    // ID -> dictionary index plus one (0 marks an empty slot). Open addressing.
+    let mut table: Vec<(Id, u32)> = vec![(0, 0); 1024];
     let mut dictionary = Vec::with_capacity(ids.len() * 6);
-    let mut runs: Vec<u32> = Vec::new();
+    let mut distinct = 0u32;
+    // (dictionary index, rows) per run.
+    let mut runs: Vec<(u32, u32)> = Vec::new();
     let mut i = 0;
     while i < ids.len() {
+        let id = ids[i];
         let mut end = i + 1;
-        while end < ids.len() && ids[end] == ids[i] {
+        while end < ids.len() && ids[end] == id {
             end += 1;
         }
-        let at = dictionary.len();
-        dictionary.extend_from_slice(&[0; 4]);
-        key::write_bytes(ids[i], &mut dictionary);
-        let len = (dictionary.len() - at - 4) as u32;
-        dictionary[at..at + 4].copy_from_slice(&len.to_le_bytes());
-        runs.push((end - i) as u32);
+        let mut at = slot_of(id as i64, table.len());
+        let entry = loop {
+            let slot = table[at];
+            if slot.1 == 0 {
+                table[at] = (id, distinct + 1);
+                let start = dictionary.len();
+                dictionary.extend_from_slice(&[0; 4]);
+                key::write_bytes(id, &mut dictionary);
+                let len = (dictionary.len() - start - 4) as u32;
+                dictionary[start..start + 4].copy_from_slice(&len.to_le_bytes());
+                distinct += 1;
+                break distinct - 1;
+            }
+            if slot.0 == id {
+                break slot.1 - 1;
+            }
+            at = (at + 1) & (table.len() - 1);
+        };
+        runs.push((entry, (end - i) as u32));
         i = end;
+        if distinct as usize * 2 > table.len() {
+            let mut bigger = vec![(0, 0); table.len() * 4];
+            for &(id, index) in table.iter().filter(|slot| slot.1 != 0) {
+                let mut at = slot_of(id as i64, bigger.len());
+                while bigger[at].1 != 0 {
+                    at = (at + 1) & (bigger.len() - 1);
+                }
+                bigger[at] = (id, index);
+            }
+            table = bigger;
+        }
     }
-    let width = bit_width((runs.len() as u32).saturating_sub(1));
-    // One RLE run per person, whatever its length: about 4 bytes for a person's rows, where
+    let width = bit_width(distinct.saturating_sub(1));
+    // One RLE run per stretch, whatever its length: about 4 bytes for a person's rows, where
     // bit-packing would spend `width` bits on every row.
     let mut data = Vec::with_capacity(runs.len() * 5 + 1);
     data.push(width as u8);
     let bytes = width.div_ceil(8) as usize;
-    for (entry, &count) in runs.iter().enumerate() {
+    for &(entry, count) in &runs {
         varint(&mut data, (count as u64) << 1);
-        data.extend_from_slice(&(entry as u32).to_le_bytes()[..bytes]);
+        data.extend_from_slice(&entry.to_le_bytes()[..bytes]);
     }
-    Chunk { dictionary, dictionary_len: runs.len(), data, values: ids.len() }
+    Chunk::dictionary_encoded(dictionary, distinct as usize, data, ids.len())
+}
+
+/// `revenue_cents` of `user_daily`: the rows that are 0 come first in the file, so they are
+/// one RLE run of index 0 into a one-entry dictionary, and the others follow as PLAIN
+/// values (`bytes` each) in their original order. A page with no values is left out.
+fn revenue_chunk(values: &[i64], bytes: usize) -> Chunk {
+    let zeros = values.iter().filter(|&&v| v == 0).count();
+    let mut chunk = Chunk { dictionary: None, pages: Vec::new() };
+    if zeros > 0 {
+        let mut data = vec![1u8];
+        varint(&mut data, (zeros as u64) << 1);
+        data.push(0);
+        chunk.dictionary = Some(Dictionary { bytes: vec![0; bytes], entries: 1 });
+        chunk.pages.push(Page { encoding: RLE_DICTIONARY, data, values: zeros });
+    }
+    if zeros < values.len() {
+        let mut data = Vec::with_capacity((values.len() - zeros) * bytes);
+        for &v in values.iter().filter(|&&v| v != 0) {
+            data.extend_from_slice(&v.to_le_bytes()[..bytes]);
+        }
+        chunk.pages.push(Page { encoding: PLAIN, data, values: values.len() - zeros });
+    }
+    chunk
+}
+
+/// The order that writes the rows with `revenue_cents == 0` first and then the others, each
+/// group in its original order.
+fn zeros_first(revenue_cents: &[i64]) -> Vec<u32> {
+    let mut order: Vec<u32> = (0..revenue_cents.len() as u32).filter(|&i| revenue_cents[i as usize] == 0).collect();
+    order.extend((0..revenue_cents.len() as u32).filter(|&i| revenue_cents[i as usize] != 0));
+    order
 }
 
 // ---- File assembly ----------------------------------------------------------------------
 
-fn page_header(kind: i32, size: usize, values: usize) -> Vec<u8> {
+fn page_header(kind: i32, size: usize, values: usize, encoding: i32) -> Vec<u8> {
     let mut t = Thrift::default();
     t.open_bare();
     t.i32(1, kind);
@@ -425,7 +510,7 @@ fn page_header(kind: i32, size: usize, values: usize) -> Vec<u8> {
     if kind == DATA_PAGE {
         t.open(5);
         t.i32(1, values as i32);
-        t.i32(2, RLE_DICTIONARY);
+        t.i32(2, encoding);
         // The level encodings are required fields even for a column without levels.
         t.i32(3, RLE);
         t.i32(4, RLE);
@@ -441,19 +526,26 @@ fn page_header(kind: i32, size: usize, values: usize) -> Vec<u8> {
 }
 
 fn write_file(path: &Path, table: &str, columns: &[Column], chunks: Vec<Chunk>, rows: usize) -> Res<()> {
-    let mut file = Vec::with_capacity(chunks.iter().map(|c| c.dictionary.len() + c.data.len() + 64).sum::<usize>() + 1024);
+    let body = |c: &Chunk| c.dictionary.as_ref().map_or(0, |d| d.bytes.len()) + c.pages.iter().map(|p| p.data.len() + 64).sum::<usize>();
+    let mut file = Vec::with_capacity(chunks.iter().map(|c| body(c) + 64).sum::<usize>() + 1024);
     file.extend_from_slice(b"PAR1");
     // (dictionary page offset, data page offset, total size) per column.
     let mut placed = Vec::new();
     if rows > 0 {
         for chunk in &chunks {
             let start = file.len();
-            file.extend_from_slice(&page_header(DICTIONARY_PAGE, chunk.dictionary.len(), chunk.dictionary_len));
-            file.extend_from_slice(&chunk.dictionary);
+            let mut dictionary_at = None;
+            if let Some(dictionary) = &chunk.dictionary {
+                dictionary_at = Some(start);
+                file.extend_from_slice(&page_header(DICTIONARY_PAGE, dictionary.bytes.len(), dictionary.entries, PLAIN));
+                file.extend_from_slice(&dictionary.bytes);
+            }
             let data_at = file.len();
-            file.extend_from_slice(&page_header(DATA_PAGE, chunk.data.len(), chunk.values));
-            file.extend_from_slice(&chunk.data);
-            placed.push((start, data_at, file.len() - start));
+            for page in &chunk.pages {
+                file.extend_from_slice(&page_header(DATA_PAGE, page.data.len(), page.values, page.encoding));
+                file.extend_from_slice(&page.data);
+            }
+            placed.push((dictionary_at, data_at, file.len() - start));
         }
     }
 
@@ -495,13 +587,22 @@ fn write_file(path: &Path, table: &str, columns: &[Column], chunks: Vec<Chunk>, 
     if rows > 0 {
         t.open_bare();
         t.list(1, T_STRUCT, columns.len());
-        for (column, &(dictionary_at, data_at, size)) in columns.iter().zip(&placed) {
+        for ((column, chunk), &(dictionary_at, data_at, size)) in columns.iter().zip(&chunks).zip(&placed) {
             t.open_bare();
-            t.i64(2, dictionary_at as i64);
+            t.i64(2, dictionary_at.unwrap_or(data_at) as i64);
             t.open(3);
             t.i32(1, column.physical);
-            t.list(2, T_I32, 3);
-            for encoding in [PLAIN, RLE, RLE_DICTIONARY] {
+            // The dictionary page is PLAIN; the data pages declare RLE for their levels.
+            let mut encodings = Vec::new();
+            if chunk.dictionary.is_some() || chunk.pages.iter().any(|p| p.encoding == PLAIN) {
+                encodings.push(PLAIN);
+            }
+            encodings.push(RLE);
+            if chunk.pages.iter().any(|p| p.encoding == RLE_DICTIONARY) {
+                encodings.push(RLE_DICTIONARY);
+            }
+            t.list(2, T_I32, encodings.len());
+            for encoding in encodings {
                 t.zigzag(encoding as i64);
             }
             t.list(3, T_BINARY, 1);
@@ -511,7 +612,9 @@ fn write_file(path: &Path, table: &str, columns: &[Column], chunks: Vec<Chunk>, 
             t.i64(6, size as i64);
             t.i64(7, size as i64);
             t.i64(9, data_at as i64);
-            t.i64(11, dictionary_at as i64);
+            if let Some(at) = dictionary_at {
+                t.i64(11, at as i64);
+            }
             t.close();
             t.close();
         }
@@ -534,21 +637,29 @@ const fn column(name: &'static str, physical: i32, logical: Logical, optional: b
 }
 
 pub fn write_user_daily(path: &Path, rows: &UserRows, categories: &[Str]) -> Res<()> {
+    // Revenue is stored in 4 bytes when every value in the file fits.
+    let narrow = rows.revenue_cents.iter().all(|&v| (0..=i32::MAX as i64).contains(&v));
+    let (revenue_type, revenue_bytes) = if narrow { (INT32, 4) } else { (INT64, 8) };
     let columns = [
         column("user_id", BYTE_ARRAY, Logical::String, false),
         column("day", INT32, Logical::Date, false),
         column("sessions", INT64, Logical::None, false),
         column("events", INT64, Logical::None, false),
-        column("revenue_cents", INT64, Logical::None, false),
+        column("revenue_cents", revenue_type, Logical::None, false),
         column("top_category", BYTE_ARRAY, Logical::String, true),
     ];
+    // Rows without purchases first: their revenue is one run of zeros and their category
+    // one run of nulls. Every column is written in this order.
+    let order = zeros_first(&rows.revenue_cents);
+    let user_id: Vec<Id> = order.iter().map(|&i| rows.user_id[i as usize]).collect();
+    let top_category: Vec<u32> = order.iter().map(|&i| rows.top_category[i as usize]).collect();
     let chunks = vec![
-        id_chunk(&rows.user_id),
-        int_chunk(rows.day.iter().map(|&d| d as i64), 4),
-        int_chunk(rows.sessions.iter().copied(), 8),
-        int_chunk(rows.events.iter().copied(), 8),
-        int_chunk(rows.revenue_cents.iter().copied(), 8),
-        name_chunk(&rows.top_category, categories, Some(NO_CATEGORY)),
+        id_chunk(&user_id),
+        int_chunk(order.iter().map(|&i| rows.day[i as usize] as i64), 4),
+        int_chunk(order.iter().map(|&i| rows.sessions[i as usize]), 8),
+        int_chunk(order.iter().map(|&i| rows.events[i as usize]), 8),
+        revenue_chunk(&rows.revenue_cents, revenue_bytes),
+        name_chunk(&top_category, categories, Some(NO_CATEGORY)),
     ];
     write_file(path, "user_daily", &columns, chunks, rows.user_id.len())
 }
@@ -682,6 +793,29 @@ mod tests {
             hybrid.finish();
             assert_eq!(decode(&out, width, values.len()), values, "width {width} len {len}");
         }
+    }
+
+    #[test]
+    fn zeros_first_is_a_stable_partition() {
+        assert_eq!(zeros_first(&[5, 0, 0, 7, 0, 9]), [1, 2, 4, 0, 3, 5]);
+        assert_eq!(zeros_first(&[]), Vec::<u32>::new());
+        assert_eq!(zeros_first(&[3, 4]), [0, 1]);
+    }
+
+    #[test]
+    fn revenue_pages() {
+        // Zeros first as a dictionary page, then the other values PLAIN.
+        let chunk = revenue_chunk(&[0, 5, 0, 7], 4);
+        assert_eq!(chunk.dictionary.as_ref().map(|d| d.bytes.clone()), Some(vec![0; 4]));
+        assert_eq!(chunk.pages.len(), 2);
+        assert_eq!((chunk.pages[0].encoding, chunk.pages[0].values, chunk.pages[0].data.clone()), (RLE_DICTIONARY, 2, vec![1, 4, 0]));
+        assert_eq!((chunk.pages[1].encoding, chunk.pages[1].values), (PLAIN, 2));
+        assert_eq!(chunk.pages[1].data, [5, 0, 0, 0, 7, 0, 0, 0]);
+        // Pages without values are omitted.
+        let none = revenue_chunk(&[1, 2], 8);
+        assert!(none.dictionary.is_none() && none.pages.len() == 1 && none.pages[0].data.len() == 16);
+        let only_zeros = revenue_chunk(&[0, 0, 0], 8);
+        assert!(only_zeros.dictionary.is_some() && only_zeros.pages.len() == 1);
     }
 
     #[test]

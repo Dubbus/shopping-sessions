@@ -40,7 +40,6 @@ type Res<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 const GAP_MS: u32 = 30 * 60 * 1000;
 const WEEK_MS: i64 = 7 * DAY_MS;
-const CHUNK: u64 = 512 << 10;
 /// Seconds from 0000-01-01 to the epoch: makes any F1 time non-negative.
 const YEAR_ZERO: i64 = 62_167_219_200;
 const VALID: u32 = 1 << 31;
@@ -486,6 +485,10 @@ fn main() -> Res<()> {
     campaign_names.push(b"organic");
     channels.push(b"organic");
 
+    // Tuning knobs, for benchmarking only: unset, each takes the default chosen below.
+    let knob = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok());
+    let chunk = knob("SS_CHUNK_KB").unwrap_or(512) << 10;
+
     let mut files: Vec<(File, u64)> = Vec::new();
     let mut chunks: Vec<(Kind, usize, u64, u64)> = Vec::new();
     let mut event_bytes = 0u64;
@@ -498,7 +501,7 @@ fn main() -> Res<()> {
             }
             let mut start = 0;
             while start < len {
-                let end = (start + CHUNK).min(len);
+                let end = (start + chunk).min(len);
                 chunks.push((kind, files.len(), start, end));
                 start = end;
             }
@@ -506,8 +509,8 @@ fn main() -> Res<()> {
         }
     }
     let rough_events = (event_bytes / 64) as usize;
-    let event_bits = bits_for(rough_events, 1 << 15, 12);
-    let person_bits = bits_for(rough_events, 1 << 16, 11);
+    let event_bits = knob("SS_EVENT_BITS").map_or(bits_for(rough_events, 1 << 15, 12), |b| b as u32);
+    let person_bits = knob("SS_PERSON_BITS").map_or(bits_for(rough_events, 1 << 16, 11), |b| b as u32);
     log("open");
 
     // ---- 1. Linked IDs -------------------------------------------------------------------

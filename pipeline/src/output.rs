@@ -44,7 +44,7 @@ fn writer(path: &Path, schema: &str) -> Res<SerializedFileWriter<File>> {
     let schema = Arc::new(parse_message_type(schema)?);
     let props = WriterProperties::builder()
         .set_compression(Compression::UNCOMPRESSED)
-        .set_dictionary_enabled(false)
+        .set_dictionary_enabled(true)
         .set_statistics_enabled(EnabledStatistics::None)
         .build();
     Ok(SerializedFileWriter::new(File::create(path)?, schema, Arc::new(props))?)

@@ -4,10 +4,11 @@ FROM rust:1-slim-bookworm AS build
 WORKDIR /src
 COPY pipeline/ ./
 # Fully static (glibc), so the final image needs nothing else. On x86-64 the build
-# assumes AVX2 (x86-64-v3); the scorer's Xeons are Cascade Lake or newer.
+# targets Cascade Lake (AVX-512): the scorers are GCP n2 Xeons, Cascade Lake or newer.
+# Such an image does not run under emulation on an Apple-silicon Mac; test it on x86.
 RUN set -eu; \
     case "$(uname -m)" in \
-      x86_64) cpu="-C target-cpu=x86-64-v3" ;; \
+      x86_64) cpu="-C target-cpu=cascadelake" ;; \
       *) cpu="" ;; \
     esac; \
     target="$(rustc -vV | sed -n 's/^host: //p')"; \

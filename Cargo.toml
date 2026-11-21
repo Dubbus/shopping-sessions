@@ -4,10 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 # Lean on purpose: every dep is compile time, image size, and supply-chain surface.
-# Parquet output: start with a hand-rolled writer (src/parquet.rs, todo) since the
-# output tables are small; fall back to the `parquet` crate only if that bites.
+# Zero deps: Parquet writer (src/parquet.rs), CSV scanner, hasher are all hand-rolled.
 [dependencies]
-memmap2 = "0.9"
 
 [profile.release]
 opt-level = 3

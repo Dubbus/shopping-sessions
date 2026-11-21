@@ -10,6 +10,7 @@
 mod csv;
 mod ids;
 mod parquet;
+mod scan;
 mod ts;
 
 use std::collections::HashMap;
@@ -109,51 +110,65 @@ fn csv_files(dir: &Path) -> Vec<PathBuf> {
     v
 }
 
-struct Mapped {
-    maps: Vec<memmap2::Mmap>,
+/// Input files read with pread into per-thread buffers. mmap was much slower: first-touch
+/// page faults cost more than parsing (measured 3.4 s per 1.6 GB single-threaded on macOS).
+struct Files {
+    files: Vec<std::fs::File>,
 }
 
-impl Mapped {
-    fn open(files: &[PathBuf]) -> Self {
-        let maps = files
-            .iter()
-            .filter_map(|p| {
-                let f = std::fs::File::open(p).expect("open");
-                if f.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
-                    return None;
-                }
-                Some(unsafe { memmap2::Mmap::map(&f).expect("mmap") })
-            })
-            .collect();
-        Mapped { maps }
+thread_local! {
+    static BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+impl Files {
+    fn open(paths: &[PathBuf]) -> Self {
+        Files { files: paths.iter().map(|p| std::fs::File::open(p).expect("open")).collect() }
     }
 
-    /// (map, start, end) chunks ending on '\n', header line removed.
-    fn chunks(&self, target: usize) -> Vec<(usize, usize, usize)> {
+    /// Offset just past the first '\n' at or after `from`, or the file length.
+    fn after_newline(f: &std::fs::File, from: u64, len: u64) -> u64 {
+        use std::os::unix::fs::FileExt;
+        let mut buf = vec![0u8; 1 << 16];
+        let mut at = from;
+        while at < len {
+            let n = f.read_at(&mut buf, at).expect("read");
+            if n == 0 {
+                break;
+            }
+            if let Some(i) = memchr(b'\n', &buf[..n]) {
+                return at + i as u64 + 1;
+            }
+            at += n as u64;
+        }
+        len
+    }
+
+    /// (file, start, end) chunks of whole lines, header removed.
+    fn chunks(&self, target: u64) -> Vec<(usize, u64, u64)> {
         let mut out = Vec::new();
-        for (m, buf) in self.maps.iter().enumerate() {
-            let buf: &[u8] = buf;
-            let mut start = match memchr(b'\n', buf) {
-                Some(i) => i + 1,
-                None => continue,
-            };
-            while start < buf.len() {
-                let mut end = (start + target).min(buf.len());
-                if end < buf.len() {
-                    end = match memchr(b'\n', &buf[end..]) {
-                        Some(i) => end + i + 1,
-                        None => buf.len(),
-                    };
-                }
-                out.push((m, start, end));
+        for (i, f) in self.files.iter().enumerate() {
+            let len = f.metadata().expect("stat").len();
+            let mut start = Self::after_newline(f, 0, len);
+            while start < len {
+                let end = if start + target >= len { len } else { Self::after_newline(f, start + target, len) };
+                out.push((i, start, end));
                 start = end;
             }
         }
         out
     }
 
-    fn slice(&self, c: (usize, usize, usize)) -> &[u8] {
-        &self.maps[c.0][c.1..c.2]
+    /// Read a chunk into this thread's buffer and run `f` on it.
+    fn with_chunk<R>(&self, c: (usize, u64, u64), f: impl FnOnce(&[u8]) -> R) -> R {
+        use std::os::unix::fs::FileExt;
+        BUF.with_borrow_mut(|buf| {
+            let n = (c.2 - c.1) as usize;
+            if buf.len() < n {
+                buf.resize(n, 0);
+            }
+            self.files[c.0].read_exact_at(&mut buf[..n], c.1).expect("read");
+            f(&buf[..n])
+        })
     }
 }
 
@@ -251,7 +266,7 @@ fn main() {
     let ids = Interner::default();
 
     // ---- links: union-find, name = byte-wise smallest ID ----
-    let link_maps = Mapped::open(&csv_files(&data.join("links")));
+    let link_bufs: Vec<Vec<u8>> = csv_files(&data.join("links")).iter().map(|p| read_small(p)).collect();
     let mut node_of: FxMap<u64, u32> = FxMap::default();
     let mut parent: Vec<u32> = Vec::new();
     let mut node_key: Vec<u64> = Vec::new();
@@ -263,7 +278,7 @@ fn main() {
         }
         x
     }
-    for buf in &link_maps.maps {
+    for buf in &link_bufs {
         for line in body_lines(buf) {
             let mut f = [&b""[..]; 2];
             if !csv::fields(line, &mut f) || f[0].is_empty() || f[1].is_empty() {
@@ -303,10 +318,10 @@ fn main() {
 
     // ---- parse events + clicks ----
     let nb = threads * 8;
-    let ev_maps = Mapped::open(&csv_files(&data.join("events")));
-    let ck_maps = Mapped::open(&csv_files(&data.join("clicks")));
-    let ev_chunks = ev_maps.chunks(4 << 20);
-    let ck_chunks = ck_maps.chunks(4 << 20);
+    let ev_files = Files::open(&csv_files(&data.join("events")));
+    let ck_files = Files::open(&csv_files(&data.join("clicks")));
+    let ev_chunks = ev_files.chunks(4 << 20);
+    let ck_chunks = ck_files.chunks(4 << 20);
     let nev = ev_chunks.len();
 
     enum Parsed {
@@ -315,13 +330,12 @@ fn main() {
     }
     let parsed = par(nev + ck_chunks.len(), threads, |i| {
         if i < nev {
-            let chunk = ev_maps.slice(ev_chunks[i]);
+            ev_files.with_chunk(ev_chunks[i], |chunk| {
             let cap = chunk.len() / 70 / nb + 16;
             let mut bk: Vec<Vec<Ev>> = (0..nb).map(|_| Vec::with_capacity(cap)).collect();
-            for line in csv::lines(chunk) {
-                let mut f = [&b""[..]; 7];
-                if !csv::fields(line, &mut f) || f[0].is_empty() {
-                    continue;
+            scan::for_each::<7, _>(chunk, |f| {
+                if f[0].is_empty() {
+                    return;
                 }
                 let eid = ids.key(f[0]);
                 let ingest = ts::parse(f[3]).unwrap_or(i64::MAX);
@@ -351,26 +365,27 @@ fn main() {
                     }
                 }
                 bk[bucket(eid, nb)].push(e);
-            }
+            });
             Parsed::E(bk)
+            })
         } else {
-            let chunk = ck_maps.slice(ck_chunks[i - nev]);
+            ck_files.with_chunk(ck_chunks[i - nev], |chunk| {
             let cap = chunk.len() / 40 / nb + 16;
             let mut bk: Vec<Vec<Ck>> = (0..nb).map(|_| Vec::with_capacity(cap)).collect();
-            for line in csv::lines(chunk) {
-                let mut f = [&b""[..]; 4];
-                if !csv::fields(line, &mut f) || f[0].is_empty() || f[1].is_empty() {
-                    continue;
+            scan::for_each::<4, _>(chunk, |f| {
+                if f[0].is_empty() || f[1].is_empty() {
+                    return;
                 }
-                let Some(t) = ts::parse(f[3]) else { continue };
+                let Some(t) = ts::parse(f[3]) else { return };
                 if t < ws - REACH || t >= we {
-                    continue;
+                    return;
                 }
-                let Some(camp) = campaigns.get(f[2]) else { continue };
+                let Some(camp) = campaigns.get(f[2]) else { return };
                 let p = person(ids.key(f[1]));
                 bk[bucket(p, nb)].push(Ck { person: p, ts: t, cid: ids.key(f[0]), camp });
-            }
+            });
             Parsed::C(bk)
+            })
         }
     });
     let mut ev_parts: Vec<Vec<Vec<Ev>>> = Vec::new();

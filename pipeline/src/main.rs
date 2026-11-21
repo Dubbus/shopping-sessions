@@ -62,15 +62,31 @@ struct Event {
     category: u32,
 }
 
-/// A surviving event on its way to its person's partition. 24 bytes.
+/// A surviving event on its way to its person's partition. 16 bytes, four to a cache line.
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct Survivor {
     who: Id,
     ts: u32,
-    price: u32,
-    category: u32,
-    pad: u32,
+    /// 0, or which purchase this is: see [`purchase_ref`].
+    purchase: u32,
+}
+
+/// Purchases are about 3% of events, so their price and category travel apart from the
+/// survivors, in one list per dedup thread. A reference names the thread in its top
+/// `PURCHASE_THREAD_BITS` bits and one more than the list index in the rest; 0 is "none".
+const PURCHASE_THREAD_BITS: u32 = 6;
+
+#[inline]
+fn purchase_ref(thread: usize, index: usize) -> u32 {
+    assert!(index + 1 < 1 << (32 - PURCHASE_THREAD_BITS), "more purchases than a reference can number");
+    (thread as u32) << (32 - PURCHASE_THREAD_BITS) | (index as u32 + 1)
+}
+
+#[inline]
+fn purchase_of(purchases: &[Vec<(u32, u32)>], reference: u32) -> (u32, u32) {
+    let index = (reference & ((1 << (32 - PURCHASE_THREAD_BITS)) - 1)) as usize - 1;
+    purchases[(reference >> (32 - PURCHASE_THREAD_BITS)) as usize][index]
 }
 
 /// A valid click on its way to its person's partition. 24 bytes.
@@ -86,8 +102,8 @@ struct Click {
 // Inside a person partition, events and clicks are single integers, so that putting them
 // in order is a plain integer sort.
 //
-// An event is `ts << 32 | purchase`, where `purchase` is 0 or one more than the index of
-// its (price, category) in the partition's purchase list.
+// An event is `ts << 32 | purchase`, where `purchase` is 0 or a reference to its price and
+// category (see `purchase_ref`).
 //
 // A click is `ts << 96 | !id << 32 | campaign`: ascending order is by time, then by
 // click_id descending, which is the order the credit rule wants (see the sessions stage).
@@ -425,8 +441,6 @@ struct Sessions {
     click_start: Vec<u32>,
     events: Vec<u64>,
     clicks: Vec<u128>,
-    /// (price, category) of the partition's purchases.
-    purchases: Vec<(u32, u32)>,
     /// Clicks per campaign inside the current 7-day window, and the campaigns present.
     in_window: Vec<u32>,
     slot: Vec<u32>,
@@ -618,6 +632,9 @@ fn main() -> Res<()> {
         waiting: [Survivor; AHEAD],
         next: usize,
         out: Scatter<Survivor>,
+        /// This thread's number, and the (price, category) of the purchases it kept.
+        thread: usize,
+        purchases: Vec<(u32, u32)>,
     }
     impl Dedup {
         /// A valid event that survived dedup: once its rename-table slot has had time to
@@ -631,7 +648,14 @@ fn main() -> Res<()> {
                 // Halfway through its wait, a survivor's tag is here: fetch its slot if needed.
                 renames.prefetch_slot(self.waiting[(slot + AHEAD / 2) % AHEAD].who);
             }
-            self.waiting[slot] = Survivor { who: event.user, ts: event.ts, price: (event.ingest_price & 0xFF_FFFF) as u32, category: event.category & !VALID, pad: 0 };
+            let price = (event.ingest_price & 0xFF_FFFF) as u32;
+            let purchase = if price != 0 {
+                self.purchases.push((price, event.category & !VALID));
+                purchase_ref(self.thread, self.purchases.len() - 1)
+            } else {
+                0
+            };
+            self.waiting[slot] = Survivor { who: event.user, ts: event.ts, purchase };
             self.next += 1;
         }
 
@@ -649,16 +673,19 @@ fn main() -> Res<()> {
             self.next = 0;
         }
     }
-    let survivors: Vec<Scattered<Survivor>> = par::run(
+    assert!(threads <= 1 << PURCHASE_THREAD_BITS, "more threads than a purchase reference can name");
+    let (survivors, purchases): (Vec<Scattered<Survivor>>, Vec<Vec<(u32, u32)>>) = par::run(
         threads,
         1 << event_bits,
-        |_| Dedup {
+        |thread| Dedup {
             seen: Vec::new(),
             again: Vec::new(),
             kept: HashTable::new(),
-            waiting: [Survivor { who: 0, ts: 0, price: 0, category: 0, pad: 0 }; AHEAD],
+            waiting: [Survivor { who: 0, ts: 0, purchase: 0 }; AHEAD],
             next: 0,
             out: Scatter::new(1 << person_bits),
+            thread,
+            purchases: Vec::new(),
         },
         |state, part| {
             let count: usize = events.iter().map(|thread| thread.len(part)).sum();
@@ -720,8 +747,8 @@ fn main() -> Res<()> {
         },
     )
     .into_iter()
-    .map(|state| state.out.finish())
-    .collect();
+    .map(|state| (state.out.finish(), state.purchases))
+    .unzip();
     drop(events);
     log("dedup");
 
@@ -751,7 +778,6 @@ fn main() -> Res<()> {
             click_start: Vec::new(),
             events: Vec::new(),
             clicks: Vec::new(),
-            purchases: Vec::new(),
             in_window: vec![0; campaign_count],
             slot: vec![0; campaign_count],
             active: Vec::new(),
@@ -787,16 +813,9 @@ fn main() -> Res<()> {
             offsets(&mut s.event_start);
             s.events.clear();
             s.events.resize(s.owner.len(), 0);
-            s.purchases.clear();
             for (event, &person) in survivors.iter().flat_map(|thread| thread.slices(part)).flatten().zip(&s.owner) {
-                let purchase = if event.price != 0 {
-                    s.purchases.push((event.price, event.category));
-                    s.purchases.len() as u64
-                } else {
-                    0
-                };
                 let at = &mut s.event_start[person as usize + 1];
-                s.events[*at as usize] = (event.ts as u64) << 32 | purchase;
+                s.events[*at as usize] = (event.ts as u64) << 32 | event.purchase as u64;
                 *at += 1;
             }
             // Each start slid one person along while filling; entry p is again where p begins.
@@ -886,7 +905,7 @@ fn main() -> Res<()> {
                         count += 1;
                         let purchase = events[i] as u32;
                         if purchase != 0 {
-                            let (price, category) = s.purchases[purchase as usize - 1];
+                            let (price, category) = purchase_of(&purchases, purchase);
                             revenue += price as u64;
                             match s.day_categories.iter_mut().find(|c| c.0 == category) {
                                 Some(c) => c.1 += price as u64,

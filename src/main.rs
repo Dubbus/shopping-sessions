@@ -558,6 +558,7 @@ fn main() {
         fill: Vec<u32>,
         ck_off: Vec<u32>,
         ck_q: Vec<(u32, Ck)>,
+        times: [u64; 5],
         ck: Vec<Ck>,
         users: Vec<UserRow>,
         camp: Vec<[u64; 4]>,
@@ -568,11 +569,12 @@ fn main() {
         by_camp: Vec<(u32, i64)>,
     }
     let parts = workers(nb, threads, Sess::default, |st, b| {
-        let Sess { local, keys, ev_off, pid, ev, fill, ck_off, ck_q, ck, users, camp, catrev, starts, sdays, run_end, by_camp } = st;
+        let Sess { local, keys, ev_off, pid, ev, fill, ck_off, ck_q, ck, users, camp, catrev, starts, sdays, run_end, by_camp, times } = st;
         if camp.is_empty() {
             camp.resize((ncamp + 1) * ndays, [0u64; 4]);
             catrev.resize(ncats, 0);
         }
+        let tt = Instant::now();
         // Group by person with a counting sort on dense local person numbers, then sort
         // each person's few events by ts. Much cheaper than sorting the bucket by (person, ts).
         let n: usize = deduped.iter().map(|p| p.out[b].len()).sum();
@@ -617,12 +619,14 @@ fn main() {
                 }
             }
         }
+        let t_group = tt.elapsed().as_nanos() as u64;
         for q in 0..m {
             let r = &mut ev[ev_off[q] as usize..ev_off[q + 1] as usize];
             if r.len() > 1 {
                 r.sort_unstable_by_key(|e| e.t);
             }
         }
+        let t_sort = tt.elapsed().as_nanos() as u64;
         // Clicks of persons with events, grouped the same way, each group by (ts, click_id).
         ck_off.clear();
         ck_off.resize(m + 1, 0);
@@ -657,6 +661,7 @@ fn main() {
                 r.sort_unstable_by(|a, c| a.ts.cmp(&c.ts).then_with(|| ids.cmp(a.cid, c.cid)));
             }
         }
+        let t_clicks = tt.elapsed().as_nanos() as u64;
 
         for q in 0..m {
             let p = keys[q];
@@ -777,7 +782,21 @@ fn main() {
                 }
             }
         }
+        let t_end = tt.elapsed().as_nanos() as u64;
+        times[0] += t_group;
+        times[1] += t_sort - t_group;
+        times[2] += t_clicks - t_sort;
+        times[3] += t_end - t_clicks;
     });
+    if std::env::var_os("STAGE_T").is_some() {
+        let mut t = [0u64; 5];
+        for p in &parts {
+            for k in 0..5 {
+                t[k] += p.times[k];
+            }
+        }
+        eprintln!("sessions thread-ms: group {} sort {} clicks {} loop {}", t[0] / 1_000_000, t[1] / 1_000_000, t[2] / 1_000_000, t[3] / 1_000_000);
+    }
     lap("sessions");
     let parts: Vec<Part> = parts.into_iter().map(|s| Part { users: s.users, camp: s.camp }).collect();
 

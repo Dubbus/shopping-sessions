@@ -286,3 +286,28 @@ shows a real step (>= 5%), so the board tracks the rig.
 
 **Profile at the start** (perf, 8 threads): parse loop 33%, dedup 19%, sessions 12%,
 timestamps 9%, kernel page zeroing 6%, read copy 4%, per-person sort 3%.
+
+## Branch `perf`: a different direction (2026-11-21, morning)
+
+`clean-slate` is tuned row at a time. `perf` starts from it (`28ffe77`) and tries changes of
+structure instead, each measured with exact counters on `ss-pmu` (c4, PMU enabled) and timed
+on `ss-bench` (Cascade Lake, pinned like the scorer).
+
+Measured first, so we stop guessing:
+
+| Question | Answer |
+|---|---|
+| Container overhead | 0.22 s for a near-empty run (Docker itself); disk vs tmpfs output differs by only 0.02-0.03 s. Not a lever any more. |
+| Idle threads at barriers | None to speak of: 770% CPU of 800% at 8 threads. |
+| AVX-512 downclock | Not a problem: portable scanner 1.80 s vs AVX-512 1.19 s. |
+| Streaming vs plain stores | Streaming wins, 1.19 s vs 1.28 s. |
+| Timestamp mispredicts | Not the cost: a branch-free parser removed 3M of 124M misses and added 0.85G cycles. |
+
+Single-thread cycles (12.0G) are spread thin: read + links 11%, clicks 8%, index 5%, field
+cutting 8%, `ts` 10%, `ingest_ts` 3%, IDs 3%, push 7%, dedup 16%, sessions 17%. The cost is
+the amount of scalar work per row.
+
+**Approach: columnar, vectorised parse.** Cut the fields of a batch of lines into arrays first,
+then convert each column with AVX-512 eight lanes at a time: `ingest_ts` (always F1), `ts` split
+into per-format lists, then IDs and the partition push. Target: the 1.95G cycles of field
+conversion down by about half.

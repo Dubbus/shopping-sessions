@@ -552,6 +552,19 @@ fn main() -> Res<()> {
         Kind::Events => 1,
         Kind::Clicks => 2,
     });
+    // Map each file once (read-only, never unmapped; the exit reclaims it). SS_PREAD=1:
+    // read every chunk with pread instead (benchmarking).
+    let maps: Vec<Option<&'static [u8]>> = files
+        .iter()
+        .map(|(f, len)| {
+            if knob("SS_PREAD").is_some() || *len == 0 {
+                return None;
+            }
+            use std::os::fd::AsRawFd;
+            let p = unsafe { libc::mmap(std::ptr::null_mut(), *len as usize, libc::PROT_READ, libc::MAP_PRIVATE, f.as_raw_fd(), 0) };
+            (p != libc::MAP_FAILED).then(|| unsafe { std::slice::from_raw_parts(p as *const u8, *len as usize) })
+        })
+        .collect();
     let link_chunks = chunks.iter().filter(|c| c.0 == Kind::Links).count();
     let links_read = AtomicUsize::new(0);
     let all_links: Mutex<Vec<(Id, Id)>> = Mutex::new(Vec::new());
@@ -585,17 +598,42 @@ fn main() -> Res<()> {
                 return;
             }
             let (kind, file, start, end) = chunks[if item < link_chunks { item } else { item - 1 }];
+            if ctx.ablate == 7 && kind != Kind::Links {
+                return;
+            }
             let mut buf = std::mem::take(&mut out.buf);
-            let (len, first) = io::load_chunk(&files[file].0, files[file].1, start, end, &mut buf).expect("read failed");
+            // Event files: the chunk is a slice of the file's mapping, with no
+            // copy, when there is SLACK of file left after its last line; else read as usual.
+            let mapped: Option<(&[u8], usize, usize)> = match maps.get(file).copied().flatten() {
+                Some(m) if kind == Kind::Events => {
+                    let from = start.saturating_sub(1) as usize;
+                    let mut stop = end as usize;
+                    if stop > 0 && m[stop - 1] != b'\n' {
+                        stop = match memchr::memchr(b'\n', &m[stop..]) {
+                            Some(i) => stop + i + 1,
+                            None => m.len(),
+                        };
+                    }
+                    (stop + io::SLACK <= m.len()).then(|| (&m[from..stop + io::SLACK], stop - from, (start as usize) - from))
+                }
+                _ => None,
+            };
+            let (data, len, first): (&[u8], usize, usize) = match mapped {
+                Some(x) => x,
+                None => {
+                    let (len, first) = io::load_chunk(&files[file].0, files[file].1, start, end, &mut buf).expect("read failed");
+                    (&buf[..], len, first)
+                }
+            };
             let last = first + (end - start) as usize;
             let mut index = std::mem::take(&mut out.index);
             if ctx.ablate == 1 && matches!(kind, Kind::Events) {
-                std::hint::black_box(&buf);
+                std::hint::black_box(data);
                 out.buf = buf;
                 out.index = index;
                 return;
             }
-            index.build(&buf, len);
+            index.build(data, len);
             if ctx.ablate == 2 && matches!(kind, Kind::Events) {
                 out.buf = buf;
                 out.index = index;
@@ -604,14 +642,14 @@ fn main() -> Res<()> {
             match kind {
                 Kind::Links => {
                     let links = &mut out.links;
-                    index.for_each_record(&buf, first, last, |fields| parse_link(fields, links));
+                    index.for_each_record(data, first, last, |fields| parse_link(fields, links));
                     all_links.lock().unwrap().append(links);
                     links_read.fetch_add(1, Ordering::Release);
                 }
-                Kind::Events if ctx.ablate == 3 => index.for_each_record(&buf, first, last, |fields: &[&[u8]; 7]| {
+                Kind::Events if ctx.ablate == 3 => index.for_each_record(data, first, last, |fields: &[&[u8]; 7]| {
                     std::hint::black_box(fields);
                 }),
-                Kind::Events => index.for_each_record(&buf, first, last, |fields| parse_event(fields, &ctx, out)),
+                Kind::Events => index.for_each_record(data, first, last, |fields| parse_event(fields, &ctx, out)),
                 Kind::Clicks if ctx.ablate != 0 && ctx.skip & 32 != 0 => {}
                 Kind::Clicks => {
                     let renames = loop {
@@ -620,7 +658,7 @@ fn main() -> Res<()> {
                             None => std::thread::yield_now(),
                         }
                     };
-                    index.for_each_record(&buf, first, last, |fields| parse_click(fields, &ctx, renames, out));
+                    index.for_each_record(data, first, last, |fields| parse_click(fields, &ctx, renames, out));
                     out.settle_clicks(renames, person_bits);
                 }
             }

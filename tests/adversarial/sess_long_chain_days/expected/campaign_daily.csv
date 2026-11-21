@@ -1,0 +1,6 @@
+campaign_id,channel,day,sessions,purchasing_sessions,revenue_cents,assisted_sessions
+c_2,social,2026-10-04,28,1,1000,28
+c_2,social,2026-10-05,48,1,1000,48
+c_2,social,2026-10-06,21,0,0,21
+organic,organic,2026-10-03,29,1,2000,0
+organic,organic,2026-10-04,20,0,0,0

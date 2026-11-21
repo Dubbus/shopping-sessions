@@ -5,20 +5,21 @@
 //! enough to stay in the CPU cache: records are passed from stage to stage by
 //! scattering them on the hash of whatever the next stage looks up.
 //!
-//!   1. parse     chunks of every CSV into records; events scattered by event_id,
-//!                clicks by user ID
-//!   2. link      IDs named in links/ -> each one's person name (union-find)
-//!   3. dedup     per event_id partition; survivors scattered by user ID
-//!   4. person    per user partition: user ID -> person name; scattered by person
-//!   5. sessions  per person partition: sort, sessions, click credit, aggregation
-//!   6. write     Parquet, one user_daily file per thread
+//!   1. link      links/ first: every linked ID -> its person's name (union-find)
+//!   2. parse     chunks of events/ and clicks/ into records, user IDs replaced by
+//!                person names; events scattered by event_id, clicks by person
+//!   3. dedup     per event_id partition; survivors scattered by person
+//!   4. sessions  per person partition: sort, sessions, click credit, aggregation
+//!   5. write     Parquet, one user_daily file per thread
 
 mod csv;
 mod io;
 mod key;
+mod link;
 mod output;
 mod par;
 mod scan;
+mod scatter;
 mod table;
 mod ts;
 
@@ -28,6 +29,7 @@ use std::time::Instant;
 
 use hashbrown::HashTable;
 use key::{Key, partition, remix};
+use scatter::{Scatter, Scattered};
 use table::{Str, StrMap};
 use ts::DAY_MS;
 
@@ -49,8 +51,8 @@ const EMPTY: u32 = u32::MAX;
 #[repr(C)]
 struct Event {
     id: Key,
-    /// Meaningful only when valid, like `ts`.
-    user: Key,
+    /// The person's name. Meaningful only when valid, like `ts`.
+    who: Key,
     /// Ingest time in seconds since year 0 (high 40 bits), price in cents (low 24; 0 unless a purchase).
     ingest_price: u64,
     /// Milliseconds since `Ctx::base`.
@@ -59,7 +61,7 @@ struct Event {
     category: u32,
 }
 
-/// A surviving event on its way to its person. `who` is the user ID, then the person's name.
+/// A surviving event on its way to its person's partition. 32 bytes.
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct Survivor {
@@ -67,9 +69,10 @@ struct Survivor {
     ts: u32,
     price: u32,
     category: u32,
+    pad: u32,
 }
 
-/// A valid click. `who` is the user ID, then the person's name.
+/// A valid click on its way to its person's partition. 48 bytes.
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct Click {
@@ -77,6 +80,7 @@ struct Click {
     id: Key,
     ts: u32,
     campaign: u32,
+    pad: u64,
 }
 
 /// An event inside its person partition: person index in the high half of the key, time in the low.
@@ -103,26 +107,51 @@ struct Ctx {
     products: StrMap,
     unknown_category: u32,
     campaigns: StrMap,
+    renames: link::Renames,
     event_bits: u32,
-    user_bits: u32,
+    person_bits: u32,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 enum Kind {
     Events,
     Clicks,
     Links,
 }
 
+/// How many records wait for their rename-table slot to arrive in cache.
+const BATCH: usize = 64;
+
 struct Parsed {
     /// By partition of the event ID.
-    events: Vec<Vec<Event>>,
-    /// By partition of the user ID.
-    clicks: Vec<Vec<Click>>,
-    links: Vec<(Key, Key)>,
+    events: Scatter<Event>,
+    /// By partition of the person.
+    clicks: Scatter<Click>,
+    /// Parsed records whose user ID is not yet replaced by the person's name, with its hash.
+    waiting_events: Vec<(Event, u64)>,
+    waiting_clicks: Vec<(Click, u64)>,
     buf: Vec<u8>,
-    tokens: Vec<u32>,
+    index: scan::Index,
     dates: ts::Dates,
+}
+
+impl Parsed {
+    /// Events step "links come before everything else": the user ID becomes the person.
+    #[inline]
+    fn settle_events(&mut self, ctx: &Ctx) {
+        for (mut event, hash) in self.waiting_events.drain(..) {
+            event.who = ctx.renames.person(event.who, hash);
+            self.events.push(partition(event.id.hash(), ctx.event_bits), event);
+        }
+    }
+
+    #[inline]
+    fn settle_clicks(&mut self, ctx: &Ctx) {
+        for (mut click, hash) in self.waiting_clicks.drain(..) {
+            click.who = ctx.renames.person(click.who, hash);
+            self.clicks.push(partition(click.who.hash(), ctx.person_bits), click);
+        }
+    }
 }
 
 /// A purchase price: ASCII digits only, 1 to 10,000,000, leading zeros allowed.
@@ -162,7 +191,7 @@ fn parse_event(&[id, user, ts, ingest, kind, product, price]: &[&[u8]; 7], ctx: 
     let Some(ingest) = out.dates.parse_f1_secs(ingest) else { return };
     let mut event = Event {
         id: unsafe { Key::identity(id) },
-        user: Key::default(),
+        who: Key::default(),
         ingest_price: ((ingest + YEAR_ZERO) as u64) << 24,
         ts: 0,
         category: 0,
@@ -186,11 +215,19 @@ fn parse_event(&[id, user, ts, ingest, kind, product, price]: &[&[u8]; 7], ctx: 
             _ => break 'valid,
         };
         event.ts = (t - ctx.base) as u32;
-        event.user = unsafe { Key::text(user) };
+        event.who = unsafe { Key::text(user) };
         event.ingest_price |= cents as u64;
         event.category |= VALID;
+        let hash = event.who.hash();
+        ctx.renames.prefetch(hash);
+        out.waiting_events.push((event, hash));
+        if out.waiting_events.len() == BATCH {
+            out.settle_events(ctx);
+        }
+        return;
     }
-    out.events[partition(event.id.hash(), ctx.event_bits)].push(event);
+    // Not valid: it can still be the copy dedup keeps, so it travels on.
+    out.events.push(partition(event.id.hash(), ctx.event_bits), event);
 }
 
 #[inline]
@@ -205,20 +242,21 @@ fn parse_click(&[id, user, campaign, ts]: &[&[u8]; 4], ctx: &Ctx, out: &mut Pars
         return;
     }
     let who = unsafe { Key::text(user) };
-    out.clicks[partition(who.hash(), ctx.user_bits)].push(Click {
-        who,
-        id: unsafe { Key::text(id) },
-        ts: (t - ctx.base) as u32,
-        campaign,
-    });
+    let hash = who.hash();
+    ctx.renames.prefetch(hash);
+    out.waiting_clicks.push((Click { who, id: unsafe { Key::text(id) }, ts: (t - ctx.base) as u32, campaign, pad: 0 }, hash));
+    if out.waiting_clicks.len() == BATCH {
+        out.settle_clicks(ctx);
+    }
 }
 
 #[inline]
-fn parse_link(&[a, b]: &[&[u8]; 2], out: &mut Parsed) {
+fn parse_link(&[a, b]: &[&[u8]; 2], out: &mut Vec<(Key, Key)>) {
+    // Links step 1: malformed lines never get here; a line with an empty side is dropped.
     if a.is_empty() || b.is_empty() {
         return;
     }
-    out.links.push(unsafe { (Key::text(a), Key::text(b)) });
+    out.push(unsafe { (Key::text(a), Key::text(b)) });
 }
 
 /// A whole small file, kept for the run because names point into it.
@@ -367,10 +405,6 @@ fn bits_for(count: usize, per_partition: usize, max_bits: u32) -> u32 {
     wanted.trailing_zeros().min(max_bits)
 }
 
-fn buckets<T>(bits: u32) -> Vec<Vec<T>> {
-    (0..1usize << bits).map(|_| Vec::new()).collect()
-}
-
 /// Per-thread state of the sessions stage.
 struct Sessions {
     rows: output::UserRows,
@@ -473,159 +507,89 @@ fn main() -> Res<()> {
     }
     let rough_events = (event_bytes / 64) as usize;
     let event_bits = bits_for(rough_events, 1 << 15, 12);
-    let user_bits = bits_for(rough_events, 1 << 16, 11);
-    let person_bits = user_bits;
-    let ctx = Ctx { window_start, window_end, base, products, unknown_category, campaigns, event_bits, user_bits };
+    let person_bits = bits_for(rough_events, 1 << 16, 11);
     log("open");
 
-    // ---- 1. Parse ------------------------------------------------------------------------
-    let mut parsed = par::run(
+    // ---- 1. Linked IDs -------------------------------------------------------------------
+    struct LinkReader {
+        links: Vec<(Key, Key)>,
+        buf: Vec<u8>,
+        index: scan::Index,
+    }
+    let link_chunks: Vec<_> = chunks.iter().copied().filter(|c| c.0 == Kind::Links).collect();
+    let links: Vec<Vec<(Key, Key)>> = par::run(
+        threads,
+        link_chunks.len(),
+        |_| LinkReader { links: Vec::new(), buf: Vec::new(), index: scan::Index::default() },
+        |out, i| {
+            let (_, file, start, end) = link_chunks[i];
+            let (len, first) = io::load_chunk(&files[file].0, files[file].1, start, end, &mut out.buf).expect("read failed");
+            out.index.build(&out.buf, len);
+            let links = &mut out.links;
+            out.index.for_each_record(&out.buf, first, first + (end - start) as usize, |fields| parse_link(fields, links));
+        },
+    )
+    .into_iter()
+    .map(|reader| reader.links)
+    .collect();
+    let renames = link::resolve(threads, &links, person_bits);
+    drop(links);
+    let ctx = Ctx { window_start, window_end, base, products, unknown_category, campaigns, renames, event_bits, person_bits };
+    log("link");
+
+    // ---- 2. Parse ------------------------------------------------------------------------
+    let chunks: Vec<_> = chunks.into_iter().filter(|c| c.0 != Kind::Links).collect();
+    let parsed = par::run(
         threads,
         chunks.len(),
-        |_| Parsed { events: buckets(event_bits), clicks: buckets(user_bits), links: Vec::new(), buf: Vec::new(), tokens: Vec::new(), dates: ts::Dates::new() },
+        |_| Parsed {
+            events: Scatter::new(1 << event_bits),
+            clicks: Scatter::new(1 << person_bits),
+            waiting_events: Vec::with_capacity(BATCH),
+            waiting_clicks: Vec::with_capacity(BATCH),
+            buf: Vec::new(),
+            index: scan::Index::default(),
+            dates: ts::Dates::new(),
+        },
         |out, i| {
             let (kind, file, start, end) = chunks[i];
             let mut buf = std::mem::take(&mut out.buf);
             let (len, first) = io::load_chunk(&files[file].0, files[file].1, start, end, &mut buf).expect("read failed");
-            let (data, last) = (&buf[..len], first + (end - start) as usize);
-            let mut tokens = std::mem::take(&mut out.tokens);
-            scan::index(data, &mut tokens);
-            match kind {
-                Kind::Events => scan::for_each_record(data, first, last, &tokens, |fields| parse_event(fields, &ctx, out)),
-                Kind::Clicks => scan::for_each_record(data, first, last, &tokens, |fields| parse_click(fields, &ctx, out)),
-                Kind::Links => scan::for_each_record(data, first, last, &tokens, |fields| parse_link(fields, out)),
+            let last = first + (end - start) as usize;
+            let mut index = std::mem::take(&mut out.index);
+            index.build(&buf, len);
+            if kind == Kind::Events {
+                index.for_each_record(&buf, first, last, |fields| parse_event(fields, &ctx, out));
+                out.settle_events(&ctx);
+            } else {
+                index.for_each_record(&buf, first, last, |fields| parse_click(fields, &ctx, out));
+                out.settle_clicks(&ctx);
             }
             out.buf = buf;
-            out.tokens = tokens;
+            out.index = index;
         },
     );
     drop(files);
+    let (events, clicks): (Vec<Scattered<Event>>, Vec<Scattered<Click>>) =
+        parsed.into_iter().map(|thread| (thread.events.finish(), thread.clicks.finish())).unzip();
     log("parse");
 
-    // ---- 2. Linked IDs -------------------------------------------------------------------
-    // Give every ID that appears in a link a number, partition by partition.
-    let user_parts = 1usize << user_bits;
-    let mut link_base = vec![0usize; parsed.len() + 1];
-    for (t, thread) in parsed.iter().enumerate() {
-        link_base[t + 1] = link_base[t] + thread.links.len();
-    }
-    let link_count = link_base[parsed.len()];
-    // An endpoint: the ID, and which side of which link it is.
-    let ends = par::run(
-        threads,
-        parsed.len(),
-        |_| buckets::<(Key, u32)>(user_bits),
-        |out, t| {
-            for (i, &(a, b)) in parsed[t].links.iter().enumerate() {
-                let slot = ((link_base[t] + i) * 2) as u32;
-                out[partition(a.hash(), user_bits)].push((a, slot));
-                out[partition(b.hash(), user_bits)].push((b, slot + 1));
-            }
-        },
-    );
-    struct Nodes {
-        ids: Vec<Key>,
-        /// (endpoint slot, index into `ids`)
-        ends: Vec<(u32, u32)>,
-    }
-    let nodes: Vec<Nodes> = par::map(threads, user_parts, |part| {
-        let mut table: HashTable<(Key, u32)> = HashTable::new();
-        let mut found = Nodes { ids: Vec::new(), ends: Vec::new() };
-        for thread in &ends {
-            for &(id, slot) in &thread[part] {
-                let h = remix(id.hash());
-                let index = match table.find(h, |e| e.0 == id) {
-                    Some(e) => e.1,
-                    None => {
-                        let index = found.ids.len() as u32;
-                        found.ids.push(id);
-                        table.insert_unique(h, (id, index), |e| remix(e.0.hash()));
-                        index
-                    }
-                };
-                found.ends.push((slot, index));
-            }
-        }
-        found
-    });
-    drop(ends);
-    let mut node_base = vec![0u32; user_parts + 1];
-    for part in 0..user_parts {
-        node_base[part + 1] = node_base[part] + nodes[part].ids.len() as u32;
-    }
-    let node_count = node_base[user_parts] as usize;
-    let mut endpoint = vec![0u32; link_count * 2];
-    {
-        let cells = par::Shared(endpoint.as_mut_ptr());
-        par::run(threads, user_parts, |_| (), |_, part| {
-            let cells = cells;
-            for &(slot, index) in &nodes[part].ends {
-                // SAFETY: every slot belongs to exactly one endpoint, so no two writes collide.
-                unsafe { *cells.0.add(slot as usize) = node_base[part] + index };
-            }
-        });
-    }
-    // Links step 2: union-find over the link pairs.
-    let mut parent: Vec<u32> = (0..node_count as u32).collect();
-    fn find(parent: &mut [u32], mut x: u32) -> u32 {
-        while parent[x as usize] != x {
-            let up = parent[parent[x as usize] as usize];
-            parent[x as usize] = up;
-            x = up;
-        }
-        x
-    }
-    for pair in endpoint.chunks_exact(2) {
-        let (a, b) = (find(&mut parent, pair[0]), find(&mut parent, pair[1]));
-        if a != b {
-            parent[a.max(b) as usize] = a.min(b);
-        }
-    }
-    drop(endpoint);
-    // Links step 3: each person is named by the byte-wise smallest of their IDs.
-    let mut name: Vec<Key> = nodes.iter().flat_map(|n| n.ids.iter().copied()).collect();
-    let all_ids = name.clone();
-    for node in 0..node_count {
-        let root = find(&mut parent, node as u32) as usize;
-        if all_ids[node].cmp_bytes(&name[root]).is_lt() {
-            name[root] = all_ids[node];
-        }
-    }
-    drop(all_ids);
-    // Per partition: linked ID -> person name, for the IDs that are not their own person's name.
-    // An ID missing from these tables is a person on its own, or is itself the name.
-    let renames: Vec<HashTable<(Key, Key)>> = par::map(threads, user_parts, |part| {
-        let mut table = HashTable::new();
-        for (index, &id) in nodes[part].ids.iter().enumerate() {
-            // Roots point at themselves and every other node at most two steps away after
-            // the pass above, so follow without compressing.
-            let mut root = node_base[part] as usize + index;
-            while parent[root] as usize != root {
-                root = parent[root] as usize;
-            }
-            if name[root] != id {
-                table.insert_unique(remix(id.hash()), (id, name[root]), |e: &(Key, Key)| remix(e.0.hash()));
-            }
-        }
-        table
-    });
-    drop((nodes, parent, name));
-    log("link");
-
-    // ---- 3. Dedup events; scatter survivors by user ID --------------------------------------
+    // ---- 3. Dedup events; scatter survivors by person ---------------------------------------
     struct Dedup {
         events: Vec<Event>,
         slots: Vec<u32>,
-        out: Vec<Vec<Survivor>>,
+        out: Scatter<Survivor>,
     }
-    let deduped = par::run(
+    let survivors: Vec<Scattered<Survivor>> = par::run(
         threads,
         1 << event_bits,
-        |_| Dedup { events: Vec::new(), slots: Vec::new(), out: buckets(user_bits) },
+        |_| Dedup { events: Vec::new(), slots: Vec::new(), out: Scatter::new(1 << person_bits) },
         |state, part| {
             state.events.clear();
-            for thread in &parsed {
-                state.events.extend_from_slice(&thread.events[part]);
+            for thread in &events {
+                for slice in thread.slices(part) {
+                    state.events.extend_from_slice(slice);
+                }
             }
             let events = &state.events;
             if events.is_empty() {
@@ -660,56 +624,21 @@ fn main() -> Res<()> {
                 }
                 let event = &events[held as usize];
                 if event.category & VALID != 0 {
-                    state.out[partition(event.user.hash(), user_bits)].push(Survivor {
-                        who: event.user,
-                        ts: event.ts,
-                        price: (event.ingest_price & 0xFF_FFFF) as u32,
-                        category: event.category & !VALID,
-                    });
+                    state.out.push(
+                        partition(event.who.hash(), person_bits),
+                        Survivor { who: event.who, ts: event.ts, price: (event.ingest_price & 0xFF_FFFF) as u32, category: event.category & !VALID, pad: 0 },
+                    );
                 }
             }
         },
-    );
-    for thread in &mut parsed {
-        thread.events = Vec::new();
-    }
+    )
+    .into_iter()
+    .map(|state| state.out.finish())
+    .collect();
+    drop(events);
     log("dedup");
 
-    // ---- 4. User ID -> person; scatter by person ---------------------------------------------
-    struct ByPerson {
-        events: Vec<Vec<Survivor>>,
-        clicks: Vec<Vec<Click>>,
-    }
-    let by_person = par::run(
-        threads,
-        user_parts,
-        |_| ByPerson { events: buckets(person_bits), clicks: buckets(person_bits) },
-        |out, part| {
-            let renames = &renames[part];
-            let person = |id: Key| -> Key {
-                if renames.is_empty() {
-                    return id;
-                }
-                renames.find(remix(id.hash()), |e| e.0 == id).map_or(id, |e| e.1)
-            };
-            for thread in &deduped {
-                for event in &thread.out[part] {
-                    let who = person(event.who);
-                    out.events[partition(who.hash(), person_bits)].push(Survivor { who, ..*event });
-                }
-            }
-            for thread in &parsed {
-                for click in &thread.clicks[part] {
-                    let who = person(click.who);
-                    out.clicks[partition(who.hash(), person_bits)].push(Click { who, ..*click });
-                }
-            }
-        },
-    );
-    drop((parsed, deduped, renames));
-    log("person");
-
-    // ---- 5. Sessions, credit, assists, aggregation -----------------------------------------
+    // ---- 4. Sessions, credit, assists, aggregation -----------------------------------------
     let first_day = window_start.div_euclid(DAY_MS);
     let days = ((window_end - 1).div_euclid(DAY_MS) - first_day + 1).max(1) as usize;
     let campaign_count = campaign_names.len();
@@ -740,8 +669,8 @@ fn main() -> Res<()> {
             s.people.clear();
             s.names.clear();
             s.events.clear();
-            for thread in &by_person {
-                for event in &thread.events[part] {
+            for event in survivors.iter().flat_map(|thread| thread.slices(part)).flatten() {
+                {
                     let h = remix(event.who.hash());
                     let person = match s.people.find(h, |e| e.0 == event.who) {
                         Some(e) => e.1,
@@ -762,8 +691,8 @@ fn main() -> Res<()> {
             s.events.sort_unstable_by_key(|e| e.key);
 
             s.clicks.clear();
-            for thread in &by_person {
-                for click in &thread.clicks[part] {
+            for click in clicks.iter().flat_map(|thread| thread.slices(part)).flatten() {
+                {
                     // A person with no surviving events has no sessions to credit.
                     if let Some(e) = s.people.find(remix(click.who.hash()), |e| e.0 == click.who) {
                         s.clicks.push(PersonClick { key: (e.1 as u64) << 32 | click.ts as u64, id: click.id, campaign: click.campaign });
@@ -887,7 +816,7 @@ fn main() -> Res<()> {
     );
     log("sessions");
 
-    // ---- 6. Write ------------------------------------------------------------------------
+    // ---- 5. Write ------------------------------------------------------------------------
     let user_dir = out_dir.join("user_daily");
     let campaign_dir = out_dir.join("campaign_daily");
     for folder in [&user_dir, &campaign_dir] {

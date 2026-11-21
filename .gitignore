@@ -9,3 +9,6 @@ data/
 .venv/
 __pycache__/
 .DS_Store
+
+# Large generated adversarial cases: rebuild with scripts/make_adversarial.py --expected
+tests/adversarial/big_*/

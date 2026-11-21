@@ -1,0 +1,7 @@
+click_id,user_id,campaign_id,ts
+k1,zero,c_1,0
+k2,cross,c_2,1969-12-24T23:50:00Z
+k3,first,c_1,1969-12-18T00:00:00Z
+k4,neg,c_2,1969-12-31T23:59:59+00:00
+k5,small,c_1,86400000
+k6,epochf1,c_2,000

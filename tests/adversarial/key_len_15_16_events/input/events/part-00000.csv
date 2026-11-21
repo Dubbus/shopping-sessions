@@ -1,0 +1,16 @@
+event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents
+eeeeeeeeeeeeee,u1,2026-10-03T10:00:00Z,2026-10-03T11:00:00Z,purchase,p1,100
+eeeeeeeeeeeeeee,u1,2026-10-03T10:01:00Z,2026-10-03T11:00:00Z,purchase,p1,101
+eeeeeeeeeeeeeeee,u1,2026-10-03T10:02:00Z,2026-10-03T11:00:00Z,purchase,p1,102
+eeeeeeeeeeeeeeeee,u1,2026-10-03T10:03:00Z,2026-10-03T11:00:00Z,purchase,p1,103
+eeeeeeeeeeeeeeeeeeeeeeeeeeeeeee,u1,2026-10-03T10:04:00Z,2026-10-03T11:00:00Z,purchase,p1,104
+eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee,u1,2026-10-03T10:05:00Z,2026-10-03T11:00:00Z,purchase,p1,105
+eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee,u1,2026-10-03T10:06:00Z,2026-10-03T11:00:00Z,purchase,p1,106
+fffffffffffffffa,u1,2026-10-03T10:07:00Z,2026-10-03T11:00:00Z,purchase,p1,107
+fffffffffffffffb,u1,2026-10-03T10:08:00Z,2026-10-03T11:00:00Z,purchase,p1,108
+aggggggggggggggg,u1,2026-10-03T10:09:00Z,2026-10-03T11:00:00Z,purchase,p1,109
+bggggggggggggggg,u1,2026-10-03T10:10:00Z,2026-10-03T11:00:00Z,purchase,p1,110
+HHHHHHHHHHHHHHHH,u1,2026-10-03T10:11:00Z,2026-10-03T11:00:00Z,purchase,p1,111
+hhhhhhhhhhhhhhhh,u1,2026-10-03T10:12:00Z,2026-10-03T11:00:00Z,purchase,p1,112
+éééééééé,u1,2026-10-03T10:13:00Z,2026-10-03T11:00:00Z,purchase,p1,113
+éééééééé,u1,2026-10-03T10:14:00Z,2026-10-03T11:00:00Z,purchase,p1,114

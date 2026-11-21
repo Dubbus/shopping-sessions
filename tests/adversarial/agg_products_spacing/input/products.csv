@@ -1,0 +1,12 @@
+product_id,category
+p1,plain
+ p1,space before
+p1 ,space after
+P1,upper
+p 1,inner
+p1	,tab
+pé,utf8
+product_id,header-like
+pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp,long
+01,digits
+1,digit

@@ -1,0 +1,14 @@
+event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents
+e0,u00,2026-10-03T10:00:00Z,2026-10-03T10:01:00Z,purchase,p1,100
+e1,u01,2026-10-03T10:00:00Z,2026-10-03T10:01:00Z,purchase, p1,101
+e2,u02,2026-10-03T10:00:00Z,2026-10-03T10:01:00Z,purchase,p1 ,102
+e3,u03,2026-10-03T10:00:00Z,2026-10-03T10:01:00Z,purchase,P1,103
+e4,u04,2026-10-03T10:00:00Z,2026-10-03T10:01:00Z,purchase,p 1,104
+e5,u05,2026-10-03T10:00:00Z,2026-10-03T10:01:00Z,purchase,p1	,105
+e6,u06,2026-10-03T10:00:00Z,2026-10-03T10:01:00Z,purchase,pé,106
+e7,u07,2026-10-03T10:00:00Z,2026-10-03T10:01:00Z,purchase,product_id,107
+e8,u08,2026-10-03T10:00:00Z,2026-10-03T10:01:00Z,purchase,pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp,108
+e9,u09,2026-10-03T10:00:00Z,2026-10-03T10:01:00Z,purchase,01,109
+e10,u10,2026-10-03T10:00:00Z,2026-10-03T10:01:00Z,purchase,1,110
+x1,unk,2026-10-03T10:00:00Z,2026-10-03T10:01:00Z,purchase,p1  ,5
+x2,unk2,2026-10-03T10:00:00Z,2026-10-03T10:01:00Z,purchase,001,5

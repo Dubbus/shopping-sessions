@@ -1,0 +1,8 @@
+event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents
+e_exact,exact,2026-10-03T10:00:00Z,2026-10-03T10:01:00Z,view,p1,
+e_over1ms,over1ms,2026-10-03T10:00:00Z,2026-10-03T10:01:00Z,view,p1,
+e_under1ms,under1ms,2026-10-03T10:00:00Z,2026-10-03T10:01:00Z,view,p1,
+e_over1s,over1s,2026-10-03T10:00:00Z,2026-10-03T10:01:00Z,view,p1,
+e_ms,msstart,1791021600001,2026-10-03T10:01:00Z,view,p1,
+e_two1,two,2026-10-03T10:00:00Z,2026-10-03T10:01:00Z,view,p1,
+e_two2,two,2026-10-03T12:00:00Z,2026-10-03T12:01:00Z,view,p1,

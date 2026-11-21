@@ -1,0 +1,16 @@
+campaign_id,channel,day,sessions,purchasing_sessions,revenue_cents,assisted_sessions
+c_1,search,2026-10-01,1,1,100,1
+c_1,search,2026-10-02,1,1,101,1
+c_1,search,2026-10-03,1,1,102,1
+c_1,search,2026-10-04,1,1,103,1
+c_1,search,2026-10-05,1,1,104,1
+c_1,search,2026-10-06,1,1,105,1
+c_1,search,2026-10-07,1,1,106,1
+c_2,social,2026-10-09,1,1,108,1
+c_2,social,2026-10-10,1,1,109,1
+c_2,social,2026-10-11,1,1,110,1
+c_2,social,2026-10-12,1,1,111,1
+c_2,social,2026-10-13,1,1,112,1
+c_2,social,2026-10-14,1,1,113,1
+organic,organic,2026-10-05,20,0,0,0
+organic,organic,2026-10-08,1,1,107,0

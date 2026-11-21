@@ -1,0 +1,22 @@
+user_id,day,sessions,events,revenue_cents,top_category
+u00,2026-10-03,1,1,100,Unknown
+u01,2026-10-03,1,1,101,UNKNOWN
+u02,2026-10-03,1,1,102,null
+u03,2026-10-03,1,1,103,None
+u04,2026-10-03,1,1,104,NULL
+u05,2026-10-03,1,1,105,NaN
+u06,2026-10-03,1,1,106,123
+u07,2026-10-03,1,1,107, shoes
+u08,2026-10-03,1,1,108,shoes 
+u09,2026-10-03,1,1,109,sho es
+u10,2026-10-03,1,1,110,-
+u11,2026-10-03,1,1,111,organic
+u12,2026-10-03,1,1,112,true
+u13,2026-10-03,1,1,113,N/A
+u14,2026-10-03,1,1,114,catégorie
+u15,2026-10-03,1,1,115,カテゴリ
+u16,2026-10-03,1,1,116,aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+u17,2026-10-03,1,1,117,top_category
+u18,2026-10-03,1,1,118,0
+u19,2026-10-03,1,1,119,1e5
+u20,2026-10-03,1,1,120,2026-10-03

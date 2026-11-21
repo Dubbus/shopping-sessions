@@ -3,8 +3,9 @@
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 
-/// Bytes kept readable after the data, so 16-byte loads at any field are in bounds.
-pub const SLACK: usize = 32;
+/// Bytes kept readable (and zero) after the data: the tokenizer loads whole 64-byte
+/// blocks and the key constructors load 16 bytes at any field.
+pub const SLACK: usize = crate::scan::SLACK;
 const STEP: usize = 64 << 10;
 
 fn read_full(file: &File, buf: &mut [u8], mut offset: u64) -> std::io::Result<usize> {

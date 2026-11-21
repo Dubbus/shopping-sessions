@@ -1,0 +1,10 @@
+user_id,day,sessions,events,revenue_cents,top_category
+chain_exact,2026-10-03,1,10,0,
+chain_over,2026-10-03,10,10,0,
+exact,2026-10-03,1,2,0,
+f2,2026-10-03,2,3,0,
+msbase,2026-10-03,2,3,0,
+over1ms,2026-10-03,2,2,0,
+over1s,2026-10-03,2,2,0,
+reverse,2026-10-03,1,6,0,
+under1ms,2026-10-03,1,2,0,

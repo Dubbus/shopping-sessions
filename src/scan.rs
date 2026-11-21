@@ -173,6 +173,138 @@ pub fn for_each<'a, const N: usize, F: FnMut(&Line)>(buf: &'a [u8], mut f: F) {
     }
 }
 
+/// Two-phase scanner (simdjson style). Same contract as `for_each`.
+///
+/// Phase 1 walks the chunk in 64-byte blocks and, with no per-separator branching, writes
+/// every separator position (',' or '\n') to an index array; for each newline it records
+/// its position in that array; per block it keeps the quote mask and the running quote
+/// count. Phase 2 handles a line at a time: its field count is a subtraction, its quote
+/// count two prefix popcounts, its fields come straight from the index array.
+pub fn for_each2<const N: usize, F: FnMut(&Line)>(buf: &[u8], mut f: F) {
+    thread_local! {
+        static SCRATCH: std::cell::RefCell<(Vec<u32>, Vec<u32>, Vec<u64>, Vec<u32>)> =
+            const { std::cell::RefCell::new((Vec::new(), Vec::new(), Vec::new(), Vec::new())) };
+    }
+    let len = buf.len();
+    if len == 0 {
+        return;
+    }
+    SCRATCH.with_borrow_mut(|(idx, nls, qm, qc)| {
+        let nblocks = len.div_ceil(64);
+        idx.clear();
+        nls.clear();
+        qm.clear();
+        qc.clear();
+        // worst case every byte is a separator; +64 slack for the unconditional writes
+        idx.reserve(len + 64);
+        qm.reserve(nblocks + 1);
+        qc.reserve(nblocks + 1);
+        let ip = idx.as_mut_ptr();
+        let mut k = 0usize; // separators written
+        let mut qtotal = 0u32;
+        for blk in 0..nblocks {
+            let pos = blk * 64;
+            let (mut m, _, q) = if pos + 64 <= len {
+                block_masks(buf[pos..pos + 64].try_into().unwrap())
+            } else {
+                let mut t = [0u8; 64];
+                t[..len - pos].copy_from_slice(&buf[pos..]);
+                block_masks(&t)
+            };
+            qm.push(q);
+            qc.push(qtotal);
+            qtotal += q.count_ones();
+            // newlines in this block, as indexes into the separator array
+            let sep = m;
+            let mut nlm = {
+                let mut x = 0u64;
+                let mut mm = sep;
+                while mm != 0 {
+                    let b = mm.trailing_zeros();
+                    mm &= mm - 1;
+                    x |= ((unsafe { *buf.get_unchecked(pos + b as usize) } == b'\n') as u64) << b;
+                }
+                x
+            };
+            while nlm != 0 {
+                let b = nlm.trailing_zeros();
+                nlm &= nlm - 1;
+                let below = sep & !(u64::MAX << b);
+                nls.push((k + below.count_ones() as usize) as u32);
+            }
+            // separator positions, 8 at a time without branching on each
+            let cnt = m.count_ones() as usize;
+            let mut w = k;
+            loop {
+                for _ in 0..8 {
+                    unsafe { *ip.add(w) = (pos as u32).wrapping_add(m.trailing_zeros()) };
+                    m &= m.wrapping_sub(1);
+                    w += 1;
+                }
+                if m == 0 {
+                    break;
+                }
+            }
+            k += cnt;
+        }
+        unsafe { idx.set_len(k) };
+        qc.push(qtotal);
+        qm.push(0);
+
+        // quotes strictly before byte p
+        let quotes_before = |p: usize| -> u32 {
+            let b = p / 64;
+            let r = (p % 64) as u32;
+            qc[b] + (qm[b] & !(u64::MAX << r)).count_ones()
+        };
+        let mut lo = [0usize; 16];
+        let mut hi = [0usize; 16];
+        let base = buf.as_ptr();
+        let mut first_sep = 0usize; // separator index where the current line's run starts
+        let mut line_start = 0usize;
+        let mut handle = |first_sep: usize, last_sep: usize, line_start: usize, line_end: usize, lo: &mut [usize; 16], hi: &mut [usize; 16]| {
+            // fields: separators first_sep..=last_sep, the last one ends the line
+            if last_sep + 1 - first_sep != N || line_end == line_start {
+                return;
+            }
+            let lq = quotes_before(line_end) - quotes_before(line_start);
+            let mut start = line_start;
+            let mut quoted = 0u32;
+            let mut bad = 0u32;
+            for j in 0..N {
+                let end = if j + 1 == N { line_end } else { idx[first_sep + j] as usize };
+                let flen = end - start;
+                let first = unsafe { *base.add(start.min(len - 1)) };
+                let last = unsafe { *base.add(end.saturating_sub(1)) };
+                let qs = (first == b'"') as usize & (flen >= 1) as usize;
+                let qe = (last == b'"') as usize & (flen >= 2) as usize;
+                bad |= (qs & !qe & 1) as u32;
+                quoted += qs as u32;
+                lo[j] = start + qs;
+                hi[j] = (end - qs).max(start + qs);
+                start = end + 1;
+            }
+            if bad == 0 && lq == 2 * quoted {
+                f(&Line { base, lo, hi });
+            }
+        };
+        for &nl_k in nls.iter() {
+            let nl_k = nl_k as usize;
+            let line_end = idx[nl_k] as usize;
+            handle(first_sep, nl_k, line_start, line_end, &mut lo, &mut hi);
+            first_sep = nl_k + 1;
+            line_start = line_end + 1;
+        }
+        // last line without a trailing newline
+        if line_start < len {
+            // its separators are first_sep..k; it is well-formed iff exactly N-1 of them
+            if k - first_sep == N - 1 {
+                handle(first_sep, k, line_start, len, &mut lo, &mut hi);
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,6 +324,9 @@ mod tests {
     fn fast<const N: usize>(buf: &[u8]) -> Vec<Vec<Vec<u8>>> {
         let mut out = Vec::new();
         for_each::<N, _>(buf, |f| out.push((0..N).map(|j| f[j].to_vec()).collect()));
+        let mut out2: Vec<Vec<Vec<u8>>> = Vec::new();
+        for_each2::<N, _>(buf, |f| out2.push((0..N).map(|j| f[j].to_vec()).collect()));
+        assert_eq!(out, out2, "for_each2 differs on {:?}", String::from_utf8_lossy(buf));
         out
     }
 

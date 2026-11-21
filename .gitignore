@@ -1,0 +1,9 @@
+# Build output
+target/
+out/
+
+# Generated datasets (never checked in; the scorer mounts its own)
+dev/
+data/
+
+.DS_Store

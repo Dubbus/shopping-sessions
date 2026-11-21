@@ -320,6 +320,7 @@ fn main() {
         ev: Vec<Vec<Ev>>,
         ck: Vec<Ck>,
     }
+    let ectx = EvCtx { ids: &ids, products: &products, unknown_cat, ws, we, ws_s };
     // Items: link chunks, then the union-find (waits for them), then events, then clicks.
     let parsed = workers(
         nlk + 1 + nev + ck_chunks.len(),
@@ -359,38 +360,8 @@ fn main() {
                         if f[0].is_empty() {
                             return;
                         }
-                        let eid = ids.key(f[0]);
-                        let ingest_ms = ts::parse(f[3]);
-                        let ingest = match ingest_ms {
-                            Some(x) => (x.div_euclid(1000) - ws_s + (1 << 31)).clamp(0, u32::MAX as i64 - 1) as u32,
-                            None => u32::MAX,
-                        };
-                        let ingest_ms = ingest_ms.unwrap_or(i64::MAX);
-                        let t = ts::parse(f[2]);
-                        let kind = match f[4] {
-                            b"view" => VIEW,
-                            b"cart" => CART,
-                            b"purchase" => PURCHASE,
-                            _ => u8::MAX,
-                        };
-                        let mut e = Ev { eid, person: 0, ingest, t: 0, pc: NOT_OK, _pad: 0 };
-                        if let Some(t) = t
-                            && !f[1].is_empty()
-                            && t >= ws
-                            && t < we
-                            && kind != u8::MAX
-                            && !f[5].is_empty()
-                            && ingest_ms - t <= LATE
-                        {
-                            let p = if kind == PURCHASE { price(f[6]) } else { Some(0) };
-                            if let Some(p) = p {
-                                let cat = products.get(f[5]).unwrap_or(unknown_cat) as u32;
-                                e.pc = p | cat << 24;
-                                e.t = (t - ws) as u32;
-                                e.person = ids.key(f[1]);
-                            }
-                        }
-                        bk[bucket(eid, nbe)].push(e);
+                        let e = event_rec(f, &ectx);
+                        push_ev(&mut bk[bucket(e.eid, nbe)], e);
                     });
                 })
             } else {
@@ -836,6 +807,59 @@ fn write_users(path: &Path, users: &[UserRow], ids: &Interner, cats: &[Vec<u8>])
             Column { name: "top_category", data: top },
         ],
     )
+}
+
+struct EvCtx<'a> {
+    ids: &'a Interner,
+    products: &'a Lookup<u16>,
+    unknown_cat: u16,
+    ws: i64,
+    we: i64,
+    ws_s: i64,
+}
+
+/// One event line (event_id known non-empty) to its record; validation per rules.md.
+#[cfg_attr(feature = "prof", inline(never))]
+#[cfg_attr(not(feature = "prof"), inline(always))]
+fn event_rec(f: &[&[u8]; 7], c: &EvCtx) -> Ev {
+    let eid = c.ids.key(f[0]);
+    let ingest_ms = ts::parse(f[3]);
+    let ingest = match ingest_ms {
+        Some(x) => (x.div_euclid(1000) - c.ws_s + (1 << 31)).clamp(0, u32::MAX as i64 - 1) as u32,
+        None => u32::MAX,
+    };
+    let ingest_ms = ingest_ms.unwrap_or(i64::MAX);
+    let t = ts::parse(f[2]);
+    let kind = match f[4] {
+        b"view" => VIEW,
+        b"cart" => CART,
+        b"purchase" => PURCHASE,
+        _ => u8::MAX,
+    };
+    let mut e = Ev { eid, person: 0, ingest, t: 0, pc: NOT_OK, _pad: 0 };
+    if let Some(t) = t
+        && !f[1].is_empty()
+        && t >= c.ws
+        && t < c.we
+        && kind != u8::MAX
+        && !f[5].is_empty()
+        && ingest_ms - t <= LATE
+    {
+        let p = if kind == PURCHASE { price(f[6]) } else { Some(0) };
+        if let Some(p) = p {
+            let cat = c.products.get(f[5]).unwrap_or(c.unknown_cat) as u32;
+            e.pc = p | cat << 24;
+            e.t = (t - c.ws) as u32;
+            e.person = c.ids.key(f[1]);
+        }
+    }
+    e
+}
+
+#[cfg_attr(feature = "prof", inline(never))]
+#[cfg_attr(not(feature = "prof"), inline(always))]
+fn push_ev(v: &mut Vec<Ev>, e: Ev) {
+    v.push(e);
 }
 
 /// Close a user-day: top category = highest summed price, tie -> smallest (sorted) name.

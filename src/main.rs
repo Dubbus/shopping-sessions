@@ -11,6 +11,7 @@ mod csv;
 mod ids;
 mod parquet;
 mod scan;
+mod table;
 mod ts;
 
 use std::collections::HashMap;
@@ -18,7 +19,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering as AO};
 use std::time::Instant;
 
-use ids::{FxMap, Interner, Lookup};
+use ids::{Interner, Lookup};
+use table::Table;
 use parquet::{Column, Data};
 use ts::DAY;
 
@@ -71,6 +73,35 @@ struct UserRow {
 #[inline]
 fn bucket(k: u64, n: usize) -> usize {
     ((k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize * n) >> 32
+}
+
+/// `threads` workers, each with its own state from `init`, pull items 0..n off a shared
+/// counter. Returns the workers' states.
+fn workers<S: Send, I: Fn() -> S + Sync, F: Fn(&mut S, usize) + Sync>(
+    n: usize,
+    threads: usize,
+    init: I,
+    f: F,
+) -> Vec<S> {
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        let hs: Vec<_> = (0..threads.max(1))
+            .map(|_| {
+                s.spawn(|| {
+                    let mut st = init();
+                    loop {
+                        let i = next.fetch_add(1, AO::Relaxed);
+                        if i >= n {
+                            break;
+                        }
+                        f(&mut st, i);
+                    }
+                    st
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    })
 }
 
 /// Run f(i) for i in 0..n on `threads` threads; results in index order.
@@ -266,10 +297,23 @@ fn main() {
     let ids = Interner::default();
 
     // ---- links: union-find, name = byte-wise smallest ID ----
-    let link_bufs: Vec<Vec<u8>> = csv_files(&data.join("links")).iter().map(|p| read_small(p)).collect();
-    let mut node_of: FxMap<u64, u32> = FxMap::default();
-    let mut parent: Vec<u32> = Vec::new();
-    let mut node_key: Vec<u64> = Vec::new();
+    let lk_files = Files::open(&csv_files(&data.join("links")));
+    let lk_chunks = lk_files.chunks(1 << 20);
+    let pairs: Vec<Vec<(u64, u64)>> = par(lk_chunks.len(), threads, |i| {
+        lk_files.with_chunk(lk_chunks[i], |chunk| {
+            let mut v = Vec::with_capacity(chunk.len() / 20);
+            scan::for_each::<2, _>(chunk, |f| {
+                if !f[0].is_empty() && !f[1].is_empty() {
+                    v.push((ids.key(f[0]), ids.key(f[1])));
+                }
+            });
+            v
+        })
+    });
+    let npairs: usize = pairs.iter().map(|v| v.len()).sum();
+    let mut node_of = Table::with_capacity(npairs + 16);
+    let mut parent: Vec<u32> = Vec::with_capacity(npairs + 16);
+    let mut node_key: Vec<u64> = Vec::with_capacity(npairs + 16);
     fn find(parent: &mut [u32], mut x: u32) -> u32 {
         while parent[x as usize] != x {
             let p = parent[x as usize];
@@ -278,45 +322,50 @@ fn main() {
         }
         x
     }
-    for buf in &link_bufs {
-        for line in body_lines(buf) {
-            let mut f = [&b""[..]; 2];
-            if !csv::fields(line, &mut f) || f[0].is_empty() || f[1].is_empty() {
-                continue;
+    for &(ka, kb) in pairs.iter().flatten() {
+        let mut node = |k: u64| -> u32 {
+            let next = parent.len() as u64;
+            let (v, new) = node_of.entry(k, next);
+            let v = *v as u32;
+            if new {
+                parent.push(v);
+                node_key.push(k);
             }
-            let mut node = |k: u64| -> u32 {
-                *node_of.entry(k).or_insert_with(|| {
-                    parent.push(parent.len() as u32);
-                    node_key.push(k);
-                    (parent.len() - 1) as u32
-                })
-            };
-            let a = node(ids.key(f[0]));
-            let b = node(ids.key(f[1]));
-            let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
-            if ra != rb {
-                parent[ra as usize] = rb;
-            }
+            v
+        };
+        let a = node(ka);
+        let b = node(kb);
+        let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
+        if ra != rb {
+            parent[ra as usize] = rb;
         }
     }
-    let mut root_name: Vec<u64> = vec![u64::MAX; parent.len()];
-    let mut has_name = vec![false; parent.len()];
-    for n in 0..parent.len() as u32 {
-        let r = find(&mut parent, n) as usize;
-        let k = node_key[n as usize];
-        if !has_name[r] || ids.cmp(k, root_name[r]).is_lt() {
+    drop(pairs);
+    let nnodes = parent.len();
+    let mut root_name: Vec<u64> = vec![0; nnodes];
+    for n in 0..nnodes {
+        let r = find(&mut parent, n as u32) as usize;
+        let k = node_key[n];
+        if root_name[r] == 0 || ids.cmp(k, root_name[r]).is_lt() {
             root_name[r] = k;
-            has_name[r] = true;
         }
     }
-    let person_of: FxMap<u64, u64> = node_of
-        .iter()
-        .map(|(&k, &n)| (k, root_name[find(&mut parent, n) as usize]))
-        .collect();
-    let person = |uid: u64| -> u64 { person_of.get(&uid).copied().unwrap_or(uid) };
+    // Only IDs whose person is named by another ID need an entry; the rest map to themselves.
+    let mut person_of = Table::with_capacity(nnodes / 2 + 16);
+    for n in 0..nnodes {
+        let name = root_name[find(&mut parent, n as u32) as usize];
+        if name != node_key[n] {
+            person_of.entry(node_key[n], name);
+        }
+    }
+    drop((node_of, parent, node_key, root_name));
+    let person = |uid: u64| -> u64 { person_of.get(uid).unwrap_or(uid) };
     lap("links");
 
     // ---- parse events + clicks ----
+    // Events go to many small event_id buckets so each dedup table stays cache-sized;
+    // everything person-keyed uses fewer, bigger buckets.
+    let nbe = threads * std::env::var("NBE").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
     let nb = threads * 8;
     let ev_files = Files::open(&csv_files(&data.join("events")));
     let ck_files = Files::open(&csv_files(&data.join("clicks")));
@@ -324,119 +373,137 @@ fn main() {
     let ck_chunks = ck_files.chunks(4 << 20);
     let nev = ev_chunks.len();
 
-    enum Parsed {
-        E(Vec<Vec<Ev>>),
-        C(Vec<Vec<Ck>>),
+    let ev_bytes: u64 = ev_chunks.iter().map(|c| c.2 - c.1).sum();
+    let ck_bytes: u64 = ck_chunks.iter().map(|c| c.2 - c.1).sum();
+    // Per-worker bucket arrays, presized from the input size so they rarely regrow.
+    let ev_cap = (ev_bytes / 70 / (threads * nbe) as u64) as usize * 11 / 10 + 64;
+    let ck_cap = (ck_bytes / 40 / (threads * nb) as u64) as usize * 11 / 10 + 64;
+    struct ParseState {
+        ev: Vec<Vec<Ev>>,
+        ck: Vec<Vec<Ck>>,
     }
-    let parsed = par(nev + ck_chunks.len(), threads, |i| {
-        if i < nev {
-            ev_files.with_chunk(ev_chunks[i], |chunk| {
-            let cap = chunk.len() / 70 / nb + 16;
-            let mut bk: Vec<Vec<Ev>> = (0..nb).map(|_| Vec::with_capacity(cap)).collect();
-            scan::for_each::<7, _>(chunk, |f| {
-                if f[0].is_empty() {
-                    return;
-                }
-                let eid = ids.key(f[0]);
-                let ingest = ts::parse(f[3]).unwrap_or(i64::MAX);
-                let t = ts::parse(f[2]);
-                let kind = match f[4] {
-                    b"view" => VIEW,
-                    b"cart" => CART,
-                    b"purchase" => PURCHASE,
-                    _ => u8::MAX,
-                };
-                let mut e = Ev { eid, ingest, ts: 0, person: 0, price: 0, cat: 0, kind, ok: false };
-                if let Some(t) = t
-                    && !f[1].is_empty()
-                    && t >= ws
-                    && t < we
-                    && kind != u8::MAX
-                    && !f[5].is_empty()
-                    && ingest - t <= LATE
-                {
-                    let p = if kind == PURCHASE { price(f[6]) } else { Some(0) };
-                    if let Some(p) = p {
-                        e.ok = true;
-                        e.ts = t;
-                        e.price = p;
-                        e.cat = products.get(f[5]).unwrap_or(unknown_cat);
-                        e.person = person(ids.key(f[1]));
-                    }
-                }
-                bk[bucket(eid, nb)].push(e);
-            });
-            Parsed::E(bk)
-            })
-        } else {
-            ck_files.with_chunk(ck_chunks[i - nev], |chunk| {
-            let cap = chunk.len() / 40 / nb + 16;
-            let mut bk: Vec<Vec<Ck>> = (0..nb).map(|_| Vec::with_capacity(cap)).collect();
-            scan::for_each::<4, _>(chunk, |f| {
-                if f[0].is_empty() || f[1].is_empty() {
-                    return;
-                }
-                let Some(t) = ts::parse(f[3]) else { return };
-                if t < ws - REACH || t >= we {
-                    return;
-                }
-                let Some(camp) = campaigns.get(f[2]) else { return };
-                let p = person(ids.key(f[1]));
-                bk[bucket(p, nb)].push(Ck { person: p, ts: t, cid: ids.key(f[0]), camp });
-            });
-            Parsed::C(bk)
-            })
-        }
-    });
-    let mut ev_parts: Vec<Vec<Vec<Ev>>> = Vec::new();
-    let mut ck_parts: Vec<Vec<Vec<Ck>>> = Vec::new();
-    for p in parsed {
-        match p {
-            Parsed::E(v) => ev_parts.push(v),
-            Parsed::C(v) => ck_parts.push(v),
-        }
-    }
+    let parsed = workers(
+        nev + ck_chunks.len(),
+        threads,
+        || ParseState {
+            ev: (0..nbe).map(|_| Vec::with_capacity(ev_cap)).collect(),
+            ck: (0..nb).map(|_| Vec::with_capacity(ck_cap)).collect(),
+        },
+        |st, i| {
+            if i < nev {
+                let bk = &mut st.ev;
+                ev_files.with_chunk(ev_chunks[i], |chunk| {
+                    scan::for_each::<7, _>(chunk, |f| {
+                        if f[0].is_empty() {
+                            return;
+                        }
+                        let eid = ids.key(f[0]);
+                        let ingest = ts::parse(f[3]).unwrap_or(i64::MAX);
+                        let t = ts::parse(f[2]);
+                        let kind = match f[4] {
+                            b"view" => VIEW,
+                            b"cart" => CART,
+                            b"purchase" => PURCHASE,
+                            _ => u8::MAX,
+                        };
+                        let mut e = Ev { eid, ingest, ts: 0, person: 0, price: 0, cat: 0, kind, ok: false };
+                        if let Some(t) = t
+                            && !f[1].is_empty()
+                            && t >= ws
+                            && t < we
+                            && kind != u8::MAX
+                            && !f[5].is_empty()
+                            && ingest - t <= LATE
+                        {
+                            let p = if kind == PURCHASE { price(f[6]) } else { Some(0) };
+                            if let Some(p) = p {
+                                e.ok = true;
+                                e.ts = t;
+                                e.price = p;
+                                e.cat = products.get(f[5]).unwrap_or(unknown_cat);
+                                e.person = ids.key(f[1]); // raw user ID; resolved after dedup
+                            }
+                        }
+                        bk[bucket(eid, nbe)].push(e);
+                    });
+                })
+            } else {
+                let bk = &mut st.ck;
+                ck_files.with_chunk(ck_chunks[i - nev], |chunk| {
+                    scan::for_each::<4, _>(chunk, |f| {
+                        if f[0].is_empty() || f[1].is_empty() {
+                            return;
+                        }
+                        let Some(t) = ts::parse(f[3]) else { return };
+                        if t < ws - REACH || t >= we {
+                            return;
+                        }
+                        let Some(camp) = campaigns.get(f[2]) else { return };
+                        let p = person(ids.key(f[1]));
+                        bk[bucket(p, nb)].push(Ck { person: p, ts: t, cid: ids.key(f[0]), camp });
+                    });
+                })
+            }
+        },
+    );
     lap("parse");
 
-    // ---- dedup by event_id, re-bucket by person ----
-    let deduped: Vec<Vec<Vec<PEv>>> = par(nb, threads, |b| {
-        let mut v: Vec<Ev> = Vec::with_capacity(ev_parts.iter().map(|p| p[b].len()).sum());
-        for p in &ev_parts {
-            v.extend_from_slice(&p[b]);
-        }
-        v.sort_unstable_by_key(|e| (e.eid, e.ingest));
-        let cap = v.len() / nb + v.len() / (4 * nb) + 16;
-        let mut out: Vec<Vec<PEv>> = (0..nb).map(|_| Vec::with_capacity(cap)).collect();
-        let mut i = 0;
-        while i < v.len() {
-            let e = v[i];
-            if e.ok {
-                out[bucket(e.person, nb)].push(PEv {
-                    person: e.person,
-                    ts: e.ts,
-                    price: e.price,
-                    cat: e.cat,
-                    kind: e.kind,
-                });
+    // ---- dedup by event_id (smallest ingest_ts wins), resolve person, re-bucket ----
+    let pev_cap = (ev_bytes / 70 / (threads * nb) as u64) as usize * 11 / 10 + 64;
+    struct DedupState {
+        best: Table,
+        out: Vec<Vec<PEv>>,
+    }
+    let deduped = workers(
+        nbe,
+        threads,
+        || DedupState {
+            best: Table::with_capacity(8),
+            out: (0..nb).map(|_| Vec::with_capacity(pev_cap)).collect(),
+        },
+        |st, b| {
+            let parts: Vec<&[Ev]> = parsed.iter().map(|p| &p.ev[b][..]).collect();
+            let n: usize = parts.iter().map(|p| p.len()).sum();
+            let best = &mut st.best;
+            best.reset(n);
+            let at = |r: u64| -> &Ev { &parts[(r >> 32) as usize][(r & 0xffff_ffff) as usize] };
+            for (w, part) in parts.iter().enumerate() {
+                for (i, e) in part.iter().enumerate() {
+                    let r = ((w as u64) << 32) | i as u64;
+                    let (slot, new) = best.entry(e.eid, r);
+                    if !new && at(*slot).ingest > e.ingest {
+                        *slot = r;
+                    }
+                }
             }
-            while i < v.len() && v[i].eid == e.eid {
-                i += 1;
+            const AHEAD: usize = 16;
+            for (w, part) in parts.iter().enumerate() {
+                for i in 0..part.len() {
+                    if i + AHEAD < part.len() && part[i + AHEAD].ok {
+                        person_of.prefetch(part[i + AHEAD].person);
+                    }
+                    let e = &part[i];
+                    if !e.ok || best.get(e.eid) != Some(((w as u64) << 32) | i as u64) {
+                        continue;
+                    }
+                    let p = person(e.person);
+                    st.out[bucket(p, nb)].push(PEv { person: p, ts: e.ts, price: e.price, cat: e.cat, kind: e.kind });
+                }
             }
-        }
-        out
-    });
-    drop(ev_parts);
+        },
+    );
     lap("dedup");
 
     // ---- sessions, credit, assists per person bucket ----
     let parts: Vec<Part> = par(nb, threads, |b| {
-        let mut ev: Vec<PEv> = Vec::with_capacity(deduped.iter().map(|p| p[b].len()).sum());
+        let n: usize = deduped.iter().map(|p| p.out[b].len()).sum();
+        let mut ev: Vec<PEv> = Vec::with_capacity(n);
         for p in &deduped {
-            ev.extend_from_slice(&p[b]);
+            ev.extend_from_slice(&p.out[b]);
         }
-        let mut ck: Vec<Ck> = Vec::with_capacity(ck_parts.iter().map(|p| p[b].len()).sum());
-        for p in &ck_parts {
-            ck.extend_from_slice(&p[b]);
+        let mut ck: Vec<Ck> = Vec::with_capacity(parsed.iter().map(|p| p.ck[b].len()).sum());
+        for p in &parsed {
+            ck.extend_from_slice(&p.ck[b]);
         }
         ev.sort_unstable_by_key(|e| (e.person, e.ts));
         ck.sort_unstable_by(|a, c| {

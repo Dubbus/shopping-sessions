@@ -19,7 +19,7 @@ if [ "$MODE" = native ]; then
   for cfg in ${BENCH_ENV:-NONE=1}; do
     for i in 1 2 3 4 5 6; do
       rm -rf ~/out-n; s=$(date +%s.%N)
-      env $(echo $cfg | tr ';' ' ') DATA_DIR=$HOME/data20 OUTPUT_DIR=$HOME/out-n NCPU=8 taskset -c $CPUS target/release/sessions 2>~/last-n.log
+      env DATA_DIR=$HOME/data20 OUTPUT_DIR=$HOME/out-n NCPU=8 $(echo $cfg | tr ';' ' ') taskset -c $CPUS target/release/sessions 2>~/last-n.log
       e=$(date +%s.%N); echo "$e - $s" | bc
     done | tail -5 | sort -n | awk -v c="$cfg" '{t[NR]=$1} END {printf "%-28s median %.3f  min %.3f  max %.3f\n", c, t[3], t[1], t[5]}'
   done
@@ -39,7 +39,7 @@ run ~/dev ~/out-dev 2>/dev/null
 ~/venv/bin/python scripts/compare.py ~/out-dev ~/dev-answer | tail -1
 if [ "$MODE" = perf ]; then
   RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --profile profiling --features prof -q
-  sudo perf record -F 2999 -g -o ~/perf.data -- env DATA_DIR=$HOME/data20 OUTPUT_DIR=$HOME/out-perf NCPU=8 \
+  sudo perf record -F 2999 -g -o ~/perf.data -- env DATA_DIR=$HOME/data20 OUTPUT_DIR=$HOME/out-perf NCPU=${PERF_NCPU:-8} \
     taskset -c $CPUS target/profiling/sessions 2>/dev/null
   sudo perf report -i ~/perf.data --no-children --percent-limit 1 --stdio 2>/dev/null | grep -E '^ +[0-9]' | head -40
   exit

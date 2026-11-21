@@ -22,7 +22,7 @@ setup)
   ssh_ "bash remote_setup.sh" ;;
 bench) ssh_ "bash remote_bench.sh ${2:-5} ${COMMIT:-}" ;;
 native) ssh_ "BENCH_ENV=\"${BENCH_ENV:-}\" bash remote_bench.sh native ${COMMIT:-}" ;;
-perf)  ssh_ "bash remote_bench.sh perf ${COMMIT:-}" ;;
+perf)  ssh_ "PERF_NCPU=${PERF_NCPU:-8} bash remote_bench.sh perf ${COMMIT:-}" ;;
 ssh)   gcloud compute ssh "$NAME" --zone "$ZONE" ;;
 stop)  gcloud compute instances stop "$NAME" --zone "$ZONE" ;;
 start) gcloud compute instances start "$NAME" --zone "$ZONE" ;;

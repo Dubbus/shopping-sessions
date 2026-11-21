@@ -85,13 +85,13 @@ impl Interner {
 /// Exact lookup table for small clean files (products, campaigns): packed keys go
 /// in one map, anything unpackable in another, so lookups never allocate.
 pub struct Lookup<V: Copy> {
-    packed: HashMap<u64, V>,
-    other: HashMap<Vec<u8>, V>,
+    packed: FxMap<u64, V>,
+    other: FxMap<Vec<u8>, V>,
 }
 
 impl<V: Copy> Lookup<V> {
     pub fn new() -> Self {
-        Self { packed: HashMap::new(), other: HashMap::new() }
+        Self { packed: FxMap::default(), other: FxMap::default() }
     }
     pub fn insert(&mut self, b: &[u8], v: V) {
         match pack(b) {
@@ -125,3 +125,35 @@ mod tests {
         assert!(pack(b"u123456789").is_none());
     }
 }
+
+/// Fast non-cryptographic hasher (FxHash-style). Inputs are our own packed keys,
+/// so HashDoS is not a concern.
+#[derive(Default, Clone, Copy)]
+pub struct Fx(u64);
+
+impl std::hash::Hasher for Fx {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut w = [0u8; 8];
+            w[..chunk.len()].copy_from_slice(chunk);
+            self.write_u64(u64::from_le_bytes(w));
+        }
+    }
+    #[inline]
+    fn write_u64(&mut self, v: u64) {
+        self.0 = (self.0.rotate_left(5) ^ v).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+        self.0 ^= self.0 >> 29;
+    }
+    #[inline]
+    fn write_usize(&mut self, v: usize) {
+        self.write_u64(v as u64);
+    }
+}
+
+pub type FxBuild = std::hash::BuildHasherDefault<Fx>;
+pub type FxMap<K, V> = HashMap<K, V, FxBuild>;

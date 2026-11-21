@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering as AO};
 use std::time::Instant;
 
-use ids::{Interner, Lookup};
+use ids::{FxMap, Interner, Lookup};
 use parquet::{Column, Data};
 use ts::DAY;
 
@@ -252,7 +252,7 @@ fn main() {
 
     // ---- links: union-find, name = byte-wise smallest ID ----
     let link_maps = Mapped::open(&csv_files(&data.join("links")));
-    let mut node_of: HashMap<u64, u32> = HashMap::new();
+    let mut node_of: FxMap<u64, u32> = FxMap::default();
     let mut parent: Vec<u32> = Vec::new();
     let mut node_key: Vec<u64> = Vec::new();
     fn find(parent: &mut [u32], mut x: u32) -> u32 {
@@ -294,7 +294,7 @@ fn main() {
             has_name[r] = true;
         }
     }
-    let person_of: HashMap<u64, u64> = node_of
+    let person_of: FxMap<u64, u64> = node_of
         .iter()
         .map(|(&k, &n)| (k, root_name[find(&mut parent, n) as usize]))
         .collect();
@@ -315,8 +315,10 @@ fn main() {
     }
     let parsed = par(nev + ck_chunks.len(), threads, |i| {
         if i < nev {
-            let mut bk: Vec<Vec<Ev>> = (0..nb).map(|_| Vec::new()).collect();
-            for line in csv::lines(ev_maps.slice(ev_chunks[i])) {
+            let chunk = ev_maps.slice(ev_chunks[i]);
+            let cap = chunk.len() / 70 / nb + 16;
+            let mut bk: Vec<Vec<Ev>> = (0..nb).map(|_| Vec::with_capacity(cap)).collect();
+            for line in csv::lines(chunk) {
                 let mut f = [&b""[..]; 7];
                 if !csv::fields(line, &mut f) || f[0].is_empty() {
                     continue;
@@ -352,8 +354,10 @@ fn main() {
             }
             Parsed::E(bk)
         } else {
-            let mut bk: Vec<Vec<Ck>> = (0..nb).map(|_| Vec::new()).collect();
-            for line in csv::lines(ck_maps.slice(ck_chunks[i - nev])) {
+            let chunk = ck_maps.slice(ck_chunks[i - nev]);
+            let cap = chunk.len() / 40 / nb + 16;
+            let mut bk: Vec<Vec<Ck>> = (0..nb).map(|_| Vec::with_capacity(cap)).collect();
+            for line in csv::lines(chunk) {
                 let mut f = [&b""[..]; 4];
                 if !csv::fields(line, &mut f) || f[0].is_empty() || f[1].is_empty() {
                     continue;
@@ -386,7 +390,8 @@ fn main() {
             v.extend_from_slice(&p[b]);
         }
         v.sort_unstable_by_key(|e| (e.eid, e.ingest));
-        let mut out: Vec<Vec<PEv>> = (0..nb).map(|_| Vec::new()).collect();
+        let cap = v.len() / nb + v.len() / (4 * nb) + 16;
+        let mut out: Vec<Vec<PEv>> = (0..nb).map(|_| Vec::with_capacity(cap)).collect();
         let mut i = 0;
         while i < v.len() {
             let e = v[i];
@@ -568,6 +573,8 @@ fn main() {
     write_outputs(&out, &parts, &ids, &cat_names, &camp_ids, &camp_channels, first_day, ndays)
         .expect("write outputs");
     lap("done");
+    // Skip freeing ~GBs of buffers and unmapping: the OS reclaims it all at exit.
+    std::process::exit(0);
 }
 
 /// Close a user-day: top category = highest summed price, tie -> smallest (sorted) name.

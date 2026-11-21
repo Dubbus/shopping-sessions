@@ -298,7 +298,7 @@ fn main() {
     // ---- parse events + clicks ----
     // Events go to many small event_id buckets so each dedup table stays cache-sized;
     // everything person-keyed uses fewer, bigger buckets.
-    let nbe = threads * std::env::var("NBE").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
+    let nbe = threads * std::env::var("NBE").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
     let nb = threads * 8;
     let ev_files = Files::open(&csv_files(&data.join("events")));
     let ck_files = Files::open(&csv_files(&data.join("clicks")));

@@ -23,7 +23,8 @@ impl Table {
 
     /// Empty the table, sized for `n` keys, reusing its memory.
     pub fn reset(&mut self, n: usize) {
-        let cap = (n.max(8) * 2).next_power_of_two();
+        // ~60% max load: small enough to stay in L2 for a dedup bucket, probes still short.
+        let cap = (n.max(8) * 5 / 3).next_power_of_two();
         if self.slots.len() == cap {
             self.slots.fill((0, 0));
         } else {

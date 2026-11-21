@@ -325,7 +325,6 @@ fn main() {
     // ABL (benchmarking only): 1 = scan events but skip field work, 2 = skip the bucket
     // store, 3 = full parse then exit, 4 = only read event chunks
     let abl: u32 = std::env::var("ABL").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-    let nt = std::env::var("NT").map(|v| v != "0").unwrap_or(false);
     let ectx = EvCtx { ids: &ids, products: &products, unknown_cat, ws, we, ws_s };
     // Items: link chunks, then the union-find (waits for them), then events, then clicks.
     let parsed = workers(
@@ -350,6 +349,9 @@ fn main() {
                 return;
             }
             if i == nlk {
+                if abl != 0 && std::env::var_os("NOLINKS").is_some() {
+                    return;
+                }
                 while lk_done.load(AO::Acquire) < nlk {
                     std::thread::yield_now();
                 }
@@ -375,13 +377,9 @@ fn main() {
                             std::hint::black_box(e);
                             return;
                         }
-                        push_ev(&mut bk[bucket(e.eid, nbe)], e, nt);
+                        push_ev(&mut bk[bucket(e.eid, nbe)], e);
                     });
-                    // streaming stores are weakly ordered: fence on this thread
-                    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-                    if nt {
-                        unsafe { std::arch::x86_64::_mm_sfence() };
-                    }
+
                 })
             } else {
                 let bk = &mut st.ck;
@@ -952,22 +950,7 @@ fn event_rec(f: &scan::Line, c: &EvCtx) -> Ev {
 
 #[cfg_attr(feature = "prof", inline(never))]
 #[cfg_attr(not(feature = "prof"), inline(always))]
-fn push_ev(v: &mut Vec<Ev>, e: Ev, nt: bool) {
-    // Streaming store: the record is read back much later, so skip the read-for-ownership
-    // and keep it out of cache. Needs a 32-byte aligned slot (big Vecs are 2 MiB aligned).
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    if nt && v.len() < v.capacity() {
-        let p = unsafe { v.as_mut_ptr().add(v.len()) };
-        if (p as usize) % 32 == 0 {
-            unsafe {
-                use std::arch::x86_64::*;
-                _mm256_stream_si256(p as *mut __m256i, std::mem::transmute::<Ev, __m256i>(e));
-                v.set_len(v.len() + 1);
-            }
-            return;
-        }
-    }
-    let _ = nt;
+fn push_ev(v: &mut Vec<Ev>, e: Ev) {
     v.push(e);
 }
 

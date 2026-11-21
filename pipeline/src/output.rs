@@ -11,7 +11,7 @@ use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::file::writer::{SerializedFileWriter, SerializedRowGroupWriter};
 use parquet::schema::parser::parse_message_type;
 
-use crate::key::Key;
+use crate::key::{self, Id};
 use crate::table::Str;
 
 type Res<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -19,7 +19,7 @@ type Res<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 /// Rows of `user_daily`, column by column.
 #[derive(Default)]
 pub struct UserRows {
-    pub user_id: Vec<Key>,
+    pub user_id: Vec<Id>,
     pub day: Vec<i32>,
     pub sessions: Vec<i64>,
     pub events: Vec<i64>,
@@ -59,11 +59,11 @@ fn strings(group: &mut SerializedRowGroupWriter<'_, File>, values: &[Str]) -> Re
 }
 
 /// The ID column: all names packed into one buffer, each value a slice of it.
-fn keys(group: &mut SerializedRowGroupWriter<'_, File>, values: &[Key]) -> Res<()> {
+fn keys(group: &mut SerializedRowGroupWriter<'_, File>, values: &[Id]) -> Res<()> {
     let mut packed = Vec::with_capacity(values.len() * 12);
     let mut ends = Vec::with_capacity(values.len());
-    for key in values {
-        packed.extend_from_slice(key.bytes());
+    for &id in values {
+        key::write_bytes(id, &mut packed);
         ends.push(packed.len());
     }
     let packed = Bytes::from(packed);

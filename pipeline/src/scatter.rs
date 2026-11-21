@@ -174,7 +174,6 @@ unsafe impl<T: Send> Send for Scattered<T> {}
 unsafe impl<T: Sync> Sync for Scattered<T> {}
 
 impl<T: Copy> Scattered<T> {
-    #[cfg(test)]
     pub fn len(&self, part: usize) -> usize {
         self.counts[part]
     }

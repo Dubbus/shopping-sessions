@@ -10,3 +10,4 @@ perf.data*
 /dev
 /dev-answer
 /spec
+!fixtures/**/*.csv

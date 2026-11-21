@@ -285,6 +285,31 @@ fn parse_link(&[a, b]: &[&[u8]; 2], out: &mut Vec<(Id, Id)>) {
     out.push(unsafe { (key::id(a), key::id(b)) });
 }
 
+/// Diagnostic build (branch `probe-scratch`): does anything survive between scored runs?
+/// Hidden runs report only the exit code, so the answer is an exit code:
+/// 42 = a marker from a run on a different dataset is in $SCRATCH_DIR (dev check -> practice),
+/// 43 = a marker from a run on this same dataset (one timed repeat -> the next),
+/// 44 = $OUTPUT_DIR already holds files. Nothing is cached or reused; it only looks.
+fn probe_persistence(data_dir: &Path, out_dir: &Path) {
+    let Ok(scratch) = std::env::var("SCRATCH_DIR") else { return };
+    let marker = Path::new(&scratch).join("probe-marker");
+    // The dataset's fingerprint: total size of the event files.
+    let size: u64 = std::fs::read_dir(data_dir.join("events"))
+        .map(|d| d.filter_map(|e| e.ok()?.metadata().ok()).map(|m| m.len()).sum())
+        .unwrap_or(0);
+    if let Ok(old) = std::fs::read_to_string(&marker) {
+        eprintln!("probe: marker found in {scratch}: {old:?}, this dataset {size}");
+        std::process::exit(if old.trim() == size.to_string() { 43 } else { 42 });
+    }
+    if std::fs::read_dir(out_dir).map(|mut d| d.next().is_some()).unwrap_or(false) {
+        eprintln!("probe: {} is not empty at start", out_dir.display());
+        std::process::exit(44);
+    }
+    if let Err(e) = std::fs::write(&marker, size.to_string()) {
+        eprintln!("probe: cannot write {}: {e}", marker.display());
+    }
+}
+
 /// A whole small file, kept for the run because names point into it.
 fn read_static(path: &Path) -> Res<Str> {
     Ok(Box::leak(std::fs::read(path)?.into_boxed_slice()))
@@ -484,6 +509,7 @@ fn main() -> Res<()> {
     };
     let data_dir = dir(1, "DATA_DIR", "/data");
     let out_dir = dir(2, "OUTPUT_DIR", "/output");
+    probe_persistence(&data_dir, &out_dir);
     let threads = std::env::var("NCPU")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())

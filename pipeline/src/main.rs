@@ -589,30 +589,63 @@ fn main() -> Res<()> {
     log("parse");
 
     // ---- 2. Dedup events; scatter survivors by person ---------------------------------------
-    /// How far ahead of its use a survivor's rename-table slot is requested.
+    /// How many survivors wait for their rename-table slot to arrive in cache.
     const AHEAD: usize = 16;
     struct Dedup {
         /// Two bitmaps over a hash of the event ID: seen once, seen again.
         seen: Vec<u64>,
         again: Vec<u64>,
-        /// The copy to keep of each event ID seen again: (ID, ingest_price, position).
-        kept: HashTable<(Id, u64, u32)>,
-        /// Positions of the copies that lost.
-        dead: Vec<u64>,
-        /// Valid winners, waiting for their rename-table slot.
-        ready: Vec<Survivor>,
+        /// The copy to keep of each event ID seen again, with the ID first.
+        kept: HashTable<Event>,
+        /// Valid winners waiting for their rename-table slot, oldest first from `next`.
+        waiting: [Survivor; AHEAD],
+        next: usize,
         out: Scatter<Survivor>,
+    }
+    impl Dedup {
+        /// A valid event that survived dedup: once its rename-table slot has had time to
+        /// arrive, it gets its person and goes to that person's partition.
+        #[inline]
+        fn keep(&mut self, event: &Event, renames: &link::Renames, person_bits: u32) {
+            renames.prefetch(event.user);
+            let slot = self.next % AHEAD;
+            if self.next >= AHEAD {
+                self.settle(slot, renames, person_bits);
+            }
+            self.waiting[slot] = Survivor { who: event.user, ts: event.ts, price: (event.ingest_price & 0xFF_FFFF) as u32, category: event.category & !VALID, pad: 0 };
+            self.next += 1;
+        }
+
+        #[inline]
+        fn settle(&mut self, slot: usize, renames: &link::Renames, person_bits: u32) {
+            let mut survivor = self.waiting[slot];
+            survivor.who = renames.person(survivor.who);
+            self.out.push(partition(key::hash(survivor.who), person_bits), survivor);
+        }
+
+        fn settle_all(&mut self, renames: &link::Renames, person_bits: u32) {
+            for slot in 0..self.next.min(AHEAD) {
+                self.settle(slot, renames, person_bits);
+            }
+            self.next = 0;
+        }
     }
     let survivors: Vec<Scattered<Survivor>> = par::run(
         threads,
         1 << event_bits,
-        |_| Dedup { seen: Vec::new(), again: Vec::new(), kept: HashTable::new(), dead: Vec::new(), ready: Vec::new(), out: Scatter::new(1 << person_bits) },
+        |_| Dedup {
+            seen: Vec::new(),
+            again: Vec::new(),
+            kept: HashTable::new(),
+            waiting: [Survivor { who: 0, ts: 0, price: 0, category: 0, pad: 0 }; AHEAD],
+            next: 0,
+            out: Scatter::new(1 << person_bits),
+        },
         |state, part| {
             let count: usize = events.iter().map(|thread| thread.len(part)).sum();
             if count == 0 {
                 return;
             }
-            let copies = || events.iter().flat_map(|thread| thread.slices(part)).flatten();
             // Pass 1: an event whose hash bit is set only once is certainly not duplicated.
             let bits = (count * 8).next_power_of_two().max(64);
             let shift = 64 - bits.trailing_zeros();
@@ -620,58 +653,51 @@ fn main() -> Res<()> {
             state.seen.resize(bits / 64, 0);
             state.again.clear();
             state.again.resize(bits / 64, 0);
-            for event in copies() {
-                let h = (remix(key::hash(event.id)) >> shift) as usize;
-                let (word, bit) = (h / 64, 1u64 << (h % 64));
-                state.again[word] |= state.seen[word] & bit;
-                state.seen[word] |= bit;
+            for thread in &events {
+                for slice in thread.slices(part) {
+                    for event in slice {
+                        let h = (remix(key::hash(event.id)) >> shift) as usize;
+                        let (word, bit) = (h / 64, 1u64 << (h % 64));
+                        state.again[word] |= state.seen[word] & bit;
+                        state.seen[word] |= bit;
+                    }
+                }
             }
-            // Pass 2, events step 2: among the copies of an ID that may be duplicated, keep the
-            // one ingested first. Only these few go through the exact table.
+            // Pass 2: the certainly-unique events go straight on. The few that may be
+            // duplicated go through an exact table that keeps, per ID, the copy ingested
+            // first (events step 2).
             state.kept.clear();
-            state.dead.clear();
-            state.dead.resize(count.div_ceil(64), 0);
-            for (i, event) in copies().enumerate() {
-                let h = remix(key::hash(event.id));
-                let at = (h >> shift) as usize;
-                if state.again[at / 64] >> (at % 64) & 1 == 0 {
-                    continue;
-                }
-                match state.kept.find_mut(h, |kept| kept.0 == event.id) {
-                    Some(kept) => {
-                        let loser = if event.ingest_price >> 24 < kept.1 >> 24 {
-                            let previous = kept.2;
-                            (kept.1, kept.2) = (event.ingest_price, i as u32);
-                            previous as usize
-                        } else {
-                            i
-                        };
-                        state.dead[loser / 64] |= 1 << (loser % 64);
+            for thread in &events {
+                for slice in thread.slices(part) {
+                    for event in slice {
+                        let h = remix(key::hash(event.id));
+                        let at = (h >> shift) as usize;
+                        if state.again[at / 64] >> (at % 64) & 1 == 0 {
+                            if event.category & VALID != 0 {
+                                state.keep(event, renames, person_bits);
+                            }
+                            continue;
+                        }
+                        match state.kept.find_mut(h, |kept| kept.id == event.id) {
+                            Some(kept) => {
+                                if event.ingest_price >> 24 < kept.ingest_price >> 24 {
+                                    *kept = *event;
+                                }
+                            }
+                            None => {
+                                state.kept.insert_unique(h, *event, |kept| remix(key::hash(kept.id)));
+                            }
+                        }
                     }
-                    None => {
-                        state.kept.insert_unique(h, (event.id, event.ingest_price, i as u32), |kept| remix(key::hash(kept.0)));
-                    }
                 }
             }
-            // Pass 3: the kept copies that are valid get their person and go to its partition.
-            state.ready.clear();
-            for (i, event) in copies().enumerate() {
-                if event.category & VALID == 0 || state.dead[i / 64] >> (i % 64) & 1 != 0 {
-                    continue;
-                }
-                renames.prefetch(event.user);
-                state.ready.push(Survivor { who: event.user, ts: event.ts, price: (event.ingest_price & 0xFF_FFFF) as u32, category: event.category & !VALID, pad: 0 });
-                if state.ready.len() > AHEAD {
-                    let mut survivor = state.ready[state.ready.len() - 1 - AHEAD];
-                    survivor.who = renames.person(survivor.who);
-                    state.out.push(partition(key::hash(survivor.who), person_bits), survivor);
-                }
+            // Steps 3 and 4 were decided at parse time, for whichever copy is kept.
+            let winners = std::mem::take(&mut state.kept);
+            for event in winners.iter().filter(|event| event.category & VALID != 0) {
+                state.keep(event, renames, person_bits);
             }
-            let tail = state.ready.len().saturating_sub(AHEAD);
-            for mut survivor in state.ready.drain(tail..) {
-                survivor.who = renames.person(survivor.who);
-                state.out.push(partition(key::hash(survivor.who), person_bits), survivor);
-            }
+            state.kept = winners;
+            state.settle_all(renames, person_bits);
         },
     )
     .into_iter()

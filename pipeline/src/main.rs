@@ -410,8 +410,11 @@ fn bits_for(count: usize, per_partition: usize, max_bits: u32) -> u32 {
 /// Per-thread state of the sessions stage.
 struct Sessions {
     rows: output::UserRows,
-    /// Per (campaign, day): sessions, purchasing sessions, revenue, assisted sessions.
-    campaign_days: Vec<[u64; 4]>,
+    /// Per (campaign, day): sessions, purchasing sessions, revenue.
+    campaign_days: Vec<[u64; 3]>,
+    /// Per (campaign, day): assisted sessions. Apart and small, because a session touches
+    /// one cell here for every campaign in its window.
+    assisted: Vec<u32>,
     /// Person name -> index into `names`, for this partition.
     people: HashTable<(Id, u32)>,
     names: Vec<Id>,
@@ -739,7 +742,8 @@ fn main() -> Res<()> {
         1 << person_bits,
         |_| Sessions {
             rows: output::UserRows::default(),
-            campaign_days: vec![[0; 4]; campaign_count * days],
+            campaign_days: vec![[0; 3]; campaign_count * days],
+            assisted: vec![0; campaign_count * days],
             people: HashTable::new(),
             names: Vec::new(),
             owner: Vec::new(),
@@ -931,7 +935,7 @@ fn main() -> Res<()> {
                     cell[1] += (revenue != 0) as u64;
                     cell[2] += revenue;
                     for &c in &s.active {
-                        s.campaign_days[c as usize * days + day_index][3] += 1;
+                        s.assisted[c as usize * days + day_index] += 1;
                     }
                 }
                 flush(row_day, row_sessions, row_events, row_revenue, &mut s.day_categories);
@@ -964,9 +968,10 @@ fn main() -> Res<()> {
             let mut total = [0u64; 4];
             for thread in &sessions {
                 let cell = thread.campaign_days[campaign * days + day];
-                for k in 0..4 {
+                for k in 0..3 {
                     total[k] += cell[k];
                 }
+                total[3] += thread.assisted[campaign * days + day] as u64;
             }
             if total[0] == 0 && total[3] == 0 {
                 continue;

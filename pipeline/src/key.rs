@@ -67,7 +67,7 @@ fn squeeze(big_endian: u64) -> u64 {
 ///
 /// # Safety
 /// 16 bytes must be readable from `s.as_ptr()` (the chunk buffers keep that much slack).
-#[inline]
+#[inline(always)]
 pub unsafe fn id(s: &[u8]) -> Id {
     let n = s.len();
     if n <= 9 {

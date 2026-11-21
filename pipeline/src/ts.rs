@@ -59,7 +59,7 @@ impl Dates {
     }
 
     /// Days since the epoch of the date in `b[..10]`, or `None` if it is not a real date.
-    #[inline]
+    #[inline(always)]
     fn days(&mut self, b: &[u8]) -> Option<i64> {
         let key = (u64::from_le_bytes(b[..8].try_into().unwrap()), u16::from_le_bytes([b[8], b[9]]));
         let slot = ((b[8] & 15) as usize * 10 + (b[9] & 15) as usize) & 127;
@@ -81,7 +81,7 @@ impl Dates {
     }
 
     /// `YYYY-MM-DDTHH:MM:SS` in `b[..19]`, to seconds since the epoch.
-    #[inline]
+    #[inline(always)]
     fn datetime_secs(&mut self, b: &[u8]) -> Option<i64> {
         // `HH:MM:SS` as one word. After the XOR a digit byte holds 0 to 9 and a colon byte 0;
         // adding 0x76 (0x7F for the colons) sets a byte's top bit exactly when it holds more.
@@ -99,13 +99,13 @@ impl Dates {
     }
 
     /// F1 only (`ingest_ts` is always F1), to whole seconds since the epoch.
-    #[inline]
+    #[inline(always)]
     pub fn parse_f1_secs(&mut self, b: &[u8]) -> Option<i64> {
         if b.len() == 20 && b[19] == b'Z' { self.datetime_secs(b) } else { None }
     }
 
     /// Same result as [`parse`], faster on the dates it has seen.
-    #[inline]
+    #[inline(always)]
     pub fn parse(&mut self, b: &[u8]) -> Option<i64> {
         let n = b.len();
         if n == 20 && b[19] == b'Z' {
@@ -135,7 +135,7 @@ impl Dates {
 
 /// The number written by 8 ASCII digits loaded little-endian (first digit in the low
 /// byte), or `None` if any byte is not a digit.
-#[inline]
+#[inline(always)]
 fn eight_digits(word: u64) -> Option<u64> {
     let x = word ^ 0x3030_3030_3030_3030;
     if (x.wrapping_add(0x7676_7676_7676_7676) | x) & 0x8080_8080_8080_8080 != 0 {

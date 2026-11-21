@@ -293,6 +293,10 @@ fn main() {
     // Links run as the first task of the parse stage, in parallel with event parsing:
     // events keep raw user IDs until dedup, clicks until after parsing.
     let lk_files = Files::open(&csv_files(&data.join("links")));
+    let lk_chunks = lk_files.chunks(256 << 10);
+    let nlk = lk_chunks.len();
+    let lk_pairs: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
+    let lk_done = AtomicUsize::new(0);
     let person_slot: std::sync::OnceLock<Table> = std::sync::OnceLock::new();
 
     // ---- parse events + clicks ----
@@ -316,20 +320,38 @@ fn main() {
         ev: Vec<Vec<Ev>>,
         ck: Vec<Ck>,
     }
+    // Items: link chunks, then the union-find (waits for them), then events, then clicks.
     let parsed = workers(
-        1 + nev + ck_chunks.len(),
+        nlk + 1 + nev + ck_chunks.len(),
         threads,
         || ParseState {
             ev: (0..nbe).map(|_| Vec::with_capacity(ev_cap)).collect(),
             ck: Vec::with_capacity(ck_cap * nb),
         },
         |st, i| {
-            if i == 0 {
-                let _ = person_slot.set(build_persons(&lk_files, &ids));
+            if i < nlk {
+                let mut v = Vec::with_capacity(((lk_chunks[i].2 - lk_chunks[i].1) / 20) as usize);
+                lk_files.with_chunk(lk_chunks[i], |chunk| {
+                    scan::for_each::<2, _>(chunk, |f| {
+                        if !f[0].is_empty() && !f[1].is_empty() {
+                            v.push((ids.key(f[0]), ids.key(f[1])));
+                        }
+                    });
+                });
+                lk_pairs.lock().unwrap().extend_from_slice(&v);
+                lk_done.fetch_add(1, AO::Release);
+                return;
+            }
+            if i == nlk {
+                while lk_done.load(AO::Acquire) < nlk {
+                    std::thread::yield_now();
+                }
+                let pairs = std::mem::take(&mut *lk_pairs.lock().unwrap());
+                let _ = person_slot.set(build_persons(&pairs, &ids));
                 eprintln!("{:>8.3}s links done", t0.elapsed().as_secs_f64());
                 return;
             }
-            let i = i - 1;
+            let i = i - nlk - 1;
             if i < nev {
                 let bk = &mut st.ev;
                 ev_files.with_chunk(ev_chunks[i], |chunk| {
@@ -723,18 +745,10 @@ fn main() {
 
 /// Union-find over the link files; the table maps an ID to its person's name (the
 /// byte-wise smallest ID) for every ID not named by itself.
-fn build_persons(lk_files: &Files, ids: &Interner) -> Table {
-    let mut pairs: Vec<(u64, u64)> = Vec::new();
-    for c in lk_files.chunks(1 << 24) {
-        lk_files.with_chunk(c, |chunk| {
-            scan::for_each::<2, _>(chunk, |f| {
-                if !f[0].is_empty() && !f[1].is_empty() {
-                    pairs.push((ids.key(f[0]), ids.key(f[1])));
-                }
-            });
-        });
-    }
+fn build_persons(pairs: &[(u64, u64)], ids: &Interner) -> Table {
     let npairs = pairs.len();
+    let tl = std::time::Instant::now();
+    eprintln!("links: {npairs} pairs parsed");
     let mut node_of = Table::with_capacity(npairs + 16);
     let mut parent: Vec<u32> = Vec::with_capacity(npairs + 16);
     let mut node_key: Vec<u64> = Vec::with_capacity(npairs + 16);
@@ -746,7 +760,12 @@ fn build_persons(lk_files: &Files, ids: &Interner) -> Table {
         }
         x
     }
-    for &(ka, kb) in &pairs {
+    const AHEAD: usize = 16;
+    for (pi, &(ka, kb)) in pairs.iter().enumerate() {
+        if let Some(&(xa, xb)) = pairs.get(pi + AHEAD) {
+            node_of.prefetch(xa);
+            node_of.prefetch(xb);
+        }
         let mut node = |k: u64| -> u32 {
             let next = parent.len() as u64;
             let (v, new) = node_of.entry(k, next);
@@ -765,6 +784,7 @@ fn build_persons(lk_files: &Files, ids: &Interner) -> Table {
         }
     }
     let nnodes = parent.len();
+    eprintln!("links: union-find {nnodes} nodes {:.3}s", tl.elapsed().as_secs_f64());
     let mut root_name: Vec<u64> = vec![0; nnodes];
     for n in 0..nnodes {
         let r = find(&mut parent, n as u32) as usize;
@@ -781,6 +801,7 @@ fn build_persons(lk_files: &Files, ids: &Interner) -> Table {
             person_of.entry(node_key[n], name);
         }
     }
+    eprintln!("links: names+table {:.3}s", tl.elapsed().as_secs_f64());
     person_of
 }
 

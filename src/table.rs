@@ -16,6 +16,12 @@ fn hash(k: u64) -> u64 {
 }
 
 impl Table {
+    /// Sized for exactly `n` keys at <= ~80% load (a lookup-only table that never grows).
+    pub fn dense(n: usize) -> Self {
+        let cap = (n.max(8) * 5 / 4).next_power_of_two();
+        Table { slots: vec![(0, 0); cap], shift: 64 - cap.trailing_zeros(), len: 0 }
+    }
+
     pub fn with_capacity(n: usize) -> Self {
         let cap = (n.max(8) * 2).next_power_of_two();
         Table { slots: vec![(0, 0); cap], shift: 64 - cap.trailing_zeros(), len: 0 }
@@ -32,6 +38,13 @@ impl Table {
         }
         self.shift = 64 - cap.trailing_zeros();
         self.len = 0;
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    pub fn cap(&self) -> usize {
+        self.slots.len()
     }
 
     #[inline(always)]
@@ -76,7 +89,7 @@ impl Table {
 #[cfg_attr(feature = "prof", inline(never))]
 #[cfg_attr(not(feature = "prof"), inline(always))]
     pub fn entry(&mut self, k: u64, v: u64) -> (&mut u64, bool) {
-        if self.len * 2 >= self.slots.len() {
+        if self.len * 5 >= self.slots.len() * 4 {
             self.grow();
         }
         let mask = self.slots.len() - 1;

@@ -299,15 +299,13 @@ fn main() {
     let nlk = lk_chunks.len();
     let lk_pairs: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
     let lk_done = AtomicUsize::new(0);
-    let person_slot: std::sync::OnceLock<Table> = std::sync::OnceLock::new();
+    let person_slot: std::sync::OnceLock<Persons> = std::sync::OnceLock::new();
 
     // ---- parse events + clicks ----
-    // Events are appended to a per-thread array in file order (no scatter). After each
-    // chunk the thread sets bits for its events' IDs in its own "seen" bitmap; a second
-    // sighting in the same thread goes to a short list. Merging those finds every event ID
-    // that may occur twice (true duplicates + hash collisions): only those "candidates" need
-    // the exact dedup. Every other event is unique and goes straight to its person bucket.
-    let nb = threads * 8; // person buckets
+    // Events go to many small event_id buckets so each dedup table stays cache-sized;
+    // everything person-keyed uses fewer, bigger buckets.
+    let nbe = threads * std::env::var("NBE").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+    let nb = threads * 8;
     let ev_files = Files::open(&csv_files(&data.join("events")));
     let ck_files = Files::open(&csv_files(&data.join("clicks")));
     let chunk_kb: u64 = std::env::var("CHUNK_KB").ok().and_then(|v| v.parse().ok()).unwrap_or(512); // fits a Cascade Lake 1 MiB L2
@@ -317,21 +315,15 @@ fn main() {
 
     let ev_bytes: u64 = ev_chunks.iter().map(|c| c.2 - c.1).sum();
     let ck_bytes: u64 = ck_chunks.iter().map(|c| c.2 - c.1).sum();
-    let est_events = (ev_bytes / 70) as usize + 1024;
-    let bm_k: usize = std::env::var("BM_K").ok().and_then(|v| v.parse().ok()).unwrap_or(12);
-    let mbits = (est_events * bm_k).next_power_of_two().max(1 << 16);
-    let bm_shift = 64 - mbits.trailing_zeros();
-    let hbit = |k: u64| -> usize { (k.wrapping_mul(0xD6E8_FEB8_6659_FD93) >> bm_shift) as usize };
-    let ev_cap = est_events / threads * 12 / 10 + 1024;
-    let ck_cap = (ck_bytes / 40) as usize / threads * 12 / 10 + 1024;
+    // Per-worker bucket arrays, presized from the input size so they rarely regrow.
+    let ev_cap = (ev_bytes / 70 / (threads * nbe) as u64) as usize * 11 / 10 + 64;
+    let ck_cap = (ck_bytes / 40 / (threads * nb) as u64) as usize * 11 / 10 + 64;
     struct ParseState {
-        ev: Vec<Ev>,
-        seen: Vec<u64>,
-        again: Vec<u32>, // bitmap positions seen twice within this thread
+        ev: Vec<Vec<Ev>>,
         ck: Vec<Ck>,
     }
-    // ABL (benchmarking only): 1 = scan events but skip field work, 2 = skip the store,
-    // 3 = full parse then exit, 4 = only read event chunks
+    // ABL (benchmarking only): 1 = scan events but skip field work, 2 = skip the bucket
+    // store, 3 = full parse then exit, 4 = only read event chunks
     let abl: u32 = std::env::var("ABL").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     let ectx = EvCtx { ids: &ids, products: &products, unknown_cat, ws, we, ws_s };
     // Items: link chunks, then the union-find (waits for them), then events, then clicks.
@@ -339,10 +331,8 @@ fn main() {
         nlk + 1 + nev + ck_chunks.len(),
         threads,
         || ParseState {
-            ev: Vec::with_capacity(ev_cap),
-            seen: vec![0u64; mbits / 64],
-            again: Vec::new(),
-            ck: Vec::with_capacity(ck_cap),
+            ev: (0..nbe).map(|_| Vec::with_capacity(ev_cap)).collect(),
+            ck: Vec::with_capacity(ck_cap * nb),
         },
         |st, i| {
             if i < nlk {
@@ -369,8 +359,7 @@ fn main() {
             }
             let i = i - nlk - 1;
             if i < nev {
-                let from = st.ev.len();
-                let ev = &mut st.ev;
+                let bk = &mut st.ev;
                 ev_files.with_chunk(ev_chunks[i], |chunk| {
                     if abl == 4 {
                         std::hint::black_box(chunk);
@@ -385,24 +374,9 @@ fn main() {
                             std::hint::black_box(e);
                             return;
                         }
-                        push_ev(ev, e);
+                        push_ev(&mut bk[bucket(e.eid, nbe)], e);
                     });
-                });
-                // this chunk's event IDs into the thread's bitmap (records still in cache)
-                let (seen, again) = (&mut st.seen, &mut st.again);
-                let new = &st.ev[from..];
-                const AHEAD: usize = 8;
-                for j in 0..new.len() {
-                    if let Some(x) = new.get(j + AHEAD) {
-                        prefetch_write(&seen[hbit(x.eid) / 64]);
-                    }
-                    let h = hbit(new[j].eid);
-                    let (w, m) = (h / 64, 1u64 << (h % 64));
-                    if seen[w] & m != 0 {
-                        again.push(h as u32);
-                    }
-                    seen[w] |= m;
-                }
+                })
             } else {
                 let bk = &mut st.ck;
                 ck_files.with_chunk(ck_chunks[i - nev], |chunk| {
@@ -428,57 +402,32 @@ fn main() {
     let person_of = person_slot.into_inner().expect("links task ran");
     let person = |uid: u64| -> u64 { person_of.get(uid).unwrap_or(uid) };
 
-    // ---- merge bitmaps: multi = set in >= 2 threads, or twice within one ----
-    let words = mbits / 64;
-    let wchunk = words.div_ceil(threads * 4).max(1);
-    let mut multi = vec![0u64; words];
-    {
-        let mslice = SyncSlice(multi.as_mut_ptr(), words);
-        let mslice = &mslice;
-        let parsed = &parsed;
-        workers(words.div_ceil(wchunk), threads, || (), |_, c| {
-            let lo = c * wchunk;
-            let hi = (lo + wchunk).min(words);
-            for w in lo..hi {
-                let (mut one, mut two) = (0u64, 0u64);
-                for p in parsed.iter() {
-                    let x = p.seen[w];
-                    two |= one & x;
-                    one |= x;
-                }
-                unsafe { *mslice.0.add(w) = two };
-            }
-        });
-    }
-    for p in &parsed {
-        for &h in &p.again {
-            multi[h as usize / 64] |= 1 << (h % 64);
-        }
-    }
-    lap("merge");
-
-    // ---- route: unique events straight to person buckets, candidates to partitions ----
-    let ncp = threads * 4; // candidate partitions (by event_id)
-    let pev_cap = est_events / (threads * nb) * 12 / 10 + 256;
-    let route_items = threads * 16; // each thread's array in 16 slices, for balance
-    struct RouteState {
+    // ---- dedup by event_id (smallest ingest_ts wins), resolve person, re-bucket ----
+    let pev_cap = (ev_bytes / 70 / (threads * nb) as u64) as usize * 11 / 10 + 64;
+    struct DedupState {
+        best: Table,
+        dead: Vec<u64>,
+        seen: Vec<u64>,
+        multi: Vec<u64>,
         out: Vec<Vec<PEv>>,
-        cand: Vec<Vec<Ev>>,
         ck: Vec<Vec<Ck>>,
     }
-    let routed = workers(
-        threads + route_items,
+    let deduped = workers(
+        threads + nbe,
         threads,
-        || RouteState {
+        || DedupState {
+            best: Table::with_capacity(8),
+            dead: Vec::new(),
+            seen: Vec::new(),
+            multi: Vec::new(),
             out: (0..nb).map(|_| Vec::with_capacity(pev_cap)).collect(),
-            cand: (0..ncp).map(|_| Vec::new()).collect(),
             ck: (0..nb).map(|_| Vec::new()).collect(),
         },
         |st, b| {
-            const AHEAD: usize = 16;
             if b < threads {
                 // one worker's raw clicks: resolve person, bucket by person
                 let raw = &parsed[b].ck;
+                const AHEAD: usize = 16;
                 for i in 0..raw.len() {
                     if i + AHEAD < raw.len() {
                         person_of.prefetch(raw[i + AHEAD].person);
@@ -490,70 +439,78 @@ fn main() {
                 return;
             }
             let b = b - threads;
-            let all = &parsed[b / 16].ev;
-            let per = all.len().div_ceil(16);
-            let part = &all[(b % 16 * per).min(all.len())..((b % 16 + 1) * per).min(all.len())];
-            for i in 0..part.len() {
-                if let Some(x) = part.get(i + AHEAD) {
-                    prefetch_read(&multi[hbit(x.eid) / 64]);
-                    if x.ok() {
-                        person_of.prefetch(x.person);
-                    }
+            let parts: Vec<&[Ev]> = parsed.iter().map(|p| &p.ev[b][..]).collect();
+            let n: usize = parts.iter().map(|p| p.len()).sum();
+            // Pass 1: two cache-sized bitmaps over a hash of event_id find every event whose
+            // hash bit was hit twice. Events outside that set are certainly unique; only the
+            // candidates (~3% true duplicates + hash collisions) go through the exact table.
+            let mbits = (n.max(64) * 6).next_power_of_two();
+            let shift = 64 - mbits.trailing_zeros();
+            let hbit = |k: u64| -> usize { (k.wrapping_mul(0xD6E8_FEB8_6659_FD93) >> shift) as usize };
+            let (seen, multi) = (&mut st.seen, &mut st.multi);
+            seen.clear();
+            seen.resize(mbits / 64, 0);
+            multi.clear();
+            multi.resize(mbits / 64, 0);
+            for part in &parts {
+                for e in part.iter() {
+                    let h = hbit(e.eid);
+                    let (w, m) = (h / 64, 1u64 << (h % 64));
+                    multi[w] |= seen[w] & m;
+                    seen[w] |= m;
                 }
-                let e = &part[i];
-                let h = hbit(e.eid);
-                if multi[h / 64] >> (h % 64) & 1 == 1 {
-                    st.cand[bucket(e.eid, ncp)].push(*e);
-                } else if e.ok() {
+            }
+            // Pass 2 (candidates only): exact dedup, smallest ingest_ts wins; losers marked dead.
+            let dead = &mut st.dead;
+            dead.clear();
+            dead.resize(n.div_ceil(64), 0);
+            let best = &mut st.best;
+            best.reset(n / 4 + 64);
+            let mut g = 0usize;
+            for part in &parts {
+                for e in part.iter() {
+                    let h = hbit(e.eid);
+                    if multi[h / 64] >> (h % 64) & 1 == 1 {
+                        let (slot, new) = best.entry(e.eid, ((g as u64) << 32) | e.ingest as u64);
+                        if !new {
+                            let old = *slot;
+                            let (og, oi) = ((old >> 32) as usize, old as u32);
+                            let loser = if oi > e.ingest {
+                                *slot = ((g as u64) << 32) | e.ingest as u64;
+                                og
+                            } else {
+                                g
+                            };
+                            dead[loser / 64] |= 1 << (loser % 64);
+                        }
+                    }
+                    g += 1;
+                }
+            }
+            let mut base = Vec::with_capacity(parts.len());
+            let mut acc = 0usize;
+            for p in &parts {
+                base.push(acc);
+                acc += p.len();
+            }
+            const AHEAD: usize = 16;
+            for (w, part) in parts.iter().enumerate() {
+                for i in 0..part.len() {
+                    if i + AHEAD < part.len() && part[i + AHEAD].ok() {
+                        person_of.prefetch(part[i + AHEAD].person);
+                    }
+                    let e = &part[i];
+                    let g = base[w] + i;
+                    if !e.ok() || dead[g / 64] >> (g % 64) & 1 == 1 {
+                        continue;
+                    }
                     let p = person(e.person);
                     st.out[bucket(p, nb)].push(PEv { person: p, t: e.t, pc: e.pc });
                 }
             }
         },
     );
-    lap("route");
-
-    // ---- resolve candidates exactly: smallest ingest_ts wins (equal = identical copies) ----
-    struct ResolveState {
-        best: Table,
-        out: Vec<Vec<PEv>>,
-    }
-    let resolved = workers(
-        ncp,
-        threads,
-        || ResolveState { best: Table::with_capacity(8), out: (0..nb).map(|_| Vec::new()).collect() },
-        |st, c| {
-            let parts: Vec<&[Ev]> = routed.iter().map(|r| &r.cand[c][..]).collect();
-            let n: usize = parts.iter().map(|p| p.len()).sum();
-            st.best.reset(n + 64);
-            // value: part index << 32 | row; the record's ingest is looked up on collision
-            for (w, part) in parts.iter().enumerate() {
-                for (i, e) in part.iter().enumerate() {
-                    let r = ((w as u64) << 32) | i as u64;
-                    let (slot, new) = st.best.entry(e.eid, r);
-                    if !new {
-                        let o = *slot;
-                        let old = &parts[(o >> 32) as usize][(o & 0xffff_ffff) as usize];
-                        if e.ingest < old.ingest {
-                            *slot = r;
-                        }
-                    }
-                }
-            }
-            for (w, part) in parts.iter().enumerate() {
-                for (i, e) in part.iter().enumerate() {
-                    if e.ok() && st.best.get(e.eid) == Some(((w as u64) << 32) | i as u64) {
-                        let p = person(e.person);
-                        st.out[bucket(p, nb)].push(PEv { person: p, t: e.t, pc: e.pc });
-                    }
-                }
-            }
-        },
-    );
     lap("dedup");
-    // person-bucketed events and clicks for the sessions stage
-    let deduped: Vec<&Vec<Vec<PEv>>> = routed.iter().map(|r| &r.out).chain(resolved.iter().map(|r| &r.out)).collect();
-    let ck_buckets: Vec<&Vec<Vec<Ck>>> = routed.iter().map(|r| &r.ck).collect();
 
     // ---- sessions, credit, assists per person bucket ----
     // Per-worker scratch reused across buckets (fresh memory costs page faults).
@@ -584,14 +541,14 @@ fn main() {
         }
         // Group by person with a counting sort on dense local person numbers, then sort
         // each person's few events by ts. Much cheaper than sorting the bucket by (person, ts).
-        let n: usize = deduped.iter().map(|p| p[b].len()).sum();
+        let n: usize = deduped.iter().map(|p| p.out[b].len()).sum();
         let local = local.get_or_insert_with(|| Table::with_capacity(8));
         local.reset(n / 16 + 16);
         keys.clear();
         ev_off.clear();
         pid.clear();
         for d in &deduped {
-            for e in &d[b] {
+            for e in &d.out[b] {
                 let next = keys.len() as u64;
                 let (slot, new) = local.entry(e.person, next);
                 let q = *slot as usize;
@@ -618,7 +575,7 @@ fn main() {
             fill.extend_from_slice(&ev_off[..m]);
             let mut k = 0;
             for d in &deduped {
-                for e in &d[b] {
+                for e in &d.out[b] {
                     let q = pid[k] as usize;
                     k += 1;
                     ev[fill[q] as usize] = *e;
@@ -636,8 +593,8 @@ fn main() {
         ck_off.clear();
         ck_off.resize(m + 1, 0);
         ck_q.clear();
-        for p in &ck_buckets {
-            for c in &p[b] {
+        for p in &deduped {
+            for c in &p.ck[b] {
                 if let Some(q) = local.get(c.person) {
                     ck_off[q as usize] += 1;
                     ck_q.push((q as u32, *c));
@@ -799,7 +756,46 @@ fn main() {
 
 /// Union-find over the link files; the table maps an ID to its person's name (the
 /// byte-wise smallest ID) for every ID not named by itself.
-fn build_persons(pairs: &[(u64, u64)], ids: &Interner) -> Table {
+/// ID -> person name for IDs not named by themselves: a dense table plus a small
+/// in-cache filter bitmap, so most IDs (unlinked, or the person's own name) skip the table.
+struct Persons {
+    table: Table,
+    filter: Vec<u64>,
+    fshift: u32,
+}
+
+impl Persons {
+    fn new(n: usize) -> Self {
+        let bits = (n.max(64) * 10).next_power_of_two();
+        Persons { table: Table::dense(n), filter: vec![0; bits / 64], fshift: 64 - bits.trailing_zeros() }
+    }
+    #[inline(always)]
+    fn fbit(&self, k: u64) -> usize {
+        (k.wrapping_mul(0xA24B_AED4_963E_E407) >> self.fshift) as usize
+    }
+    fn insert(&mut self, k: u64, v: u64) {
+        let b = self.fbit(k);
+        self.filter[b / 64] |= 1 << (b % 64);
+        self.table.entry(k, v);
+    }
+    #[inline(always)]
+    fn may_have(&self, k: u64) -> bool {
+        let b = self.fbit(k);
+        self.filter[b / 64] >> (b % 64) & 1 == 1
+    }
+    #[inline(always)]
+    fn get(&self, k: u64) -> Option<u64> {
+        if self.may_have(k) { self.table.get(k) } else { None }
+    }
+    #[inline(always)]
+    fn prefetch(&self, k: u64) {
+        if self.may_have(k) {
+            self.table.prefetch(k);
+        }
+    }
+}
+
+fn build_persons(pairs: &[(u64, u64)], ids: &Interner) -> Persons {
     let npairs = pairs.len();
     let tl = std::time::Instant::now();
     eprintln!("links: {npairs} pairs parsed");
@@ -848,12 +844,16 @@ fn build_persons(pairs: &[(u64, u64)], ids: &Interner) -> Table {
         }
     }
     // Only IDs whose person is named by another ID need an entry; the rest map to themselves.
-    let mut person_of = Table::with_capacity(nnodes / 2 + 16);
+    let mut mapped: Vec<(u64, u64)> = Vec::with_capacity(nnodes);
     for n in 0..nnodes {
         let name = root_name[find(&mut parent, n as u32) as usize];
         if name != node_key[n] {
-            person_of.entry(node_key[n], name);
+            mapped.push((node_key[n], name));
         }
+    }
+    let mut person_of = Persons::new(mapped.len());
+    for &(k, v) in &mapped {
+        person_of.insert(k, v);
     }
     eprintln!("links: names+table {:.3}s", tl.elapsed().as_secs_f64());
     person_of
@@ -890,34 +890,6 @@ fn write_users(path: &Path, users: &[UserRow], ids: &Interner, cats: &[Vec<u8>])
             Column { name: "top_category", data: top },
         ],
     )
-}
-
-/// Raw pointer + len shared across worker threads that write disjoint ranges.
-struct SyncSlice(*mut u64, #[allow(dead_code)] usize);
-unsafe impl Sync for SyncSlice {}
-
-#[inline(always)]
-fn prefetch_read<T>(p: &T) {
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        std::arch::x86_64::_mm_prefetch(p as *const T as *const i8, std::arch::x86_64::_MM_HINT_T0)
-    };
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p as *const T, options(nostack, readonly, preserves_flags))
-    };
-}
-
-#[inline(always)]
-fn prefetch_write<T>(p: &T) {
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        std::arch::x86_64::_mm_prefetch(p as *const T as *const i8, std::arch::x86_64::_MM_HINT_ET0)
-    };
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        std::arch::asm!("prfm pstl1keep, [{0}]", in(reg) p as *const T, options(nostack, readonly, preserves_flags))
-    };
 }
 
 struct EvCtx<'a> {

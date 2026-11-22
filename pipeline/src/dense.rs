@@ -845,7 +845,7 @@ fn sample_lines(files: &[(PathBuf, Kind, u64)], kind: Kind, want: usize) -> Vec<
     picked.sort_by_key(|f| std::cmp::Reverse(f.2));
     for (path, _, len) in picked.into_iter().take(4) {
         let Ok(file) = File::open(path) else { continue };
-        let take = (*len).min(1 << 20);
+        let take = (*len).min(512 << 10);
         let mut buf = Vec::new();
         let Ok((n, _)) = io::load_chunk(&file, *len, 0, take, &mut buf) else { continue };
         csv::for_each_line(&buf[..n], 0, n, |line| lines.push(line.to_vec()));
@@ -883,8 +883,8 @@ fn search_from(ys: &[u64], r: usize, limit: u64, threads: usize) -> Option<u64> 
 }
 
 fn find_keys(files: &[(PathBuf, Kind, u64)], est_events: u64, est_clicks: u64, threads: usize) -> Option<Keys> {
-    let events = sample_lines(files, Kind::Events, 40_000);
-    let clicks = sample_lines(files, Kind::Clicks, 20_000);
+    let events = sample_lines(files, Kind::Events, 16_000);
+    let clicks = sample_lines(files, Kind::Clicks, 8_000);
     let decode = |s: &[u8], prefix: u8| -> Option<u64> {
         let mut padded = [0u8; 32];
         if s.len() > 16 {
@@ -1025,39 +1025,43 @@ fn people(parsed: &[Parsed], count: usize, user_key: u64, threads: usize) -> Peo
     let mut parents = vec![IDENTITY; count];
     let mut fast = vec![0u16; count];
     let (fp, pp, sp) = (SendPtr(flags.as_mut_ptr()), SendPtr(parents.as_mut_ptr()), SendPtr(fast.as_mut_ptr()));
-    // Each worker owns a range of people and reads every inner link.
+    // Each worker owns a range of people. The links are first bucketed by range, per parse thread.
     let ranges = threads * 4;
+    let range_of = |p: usize| (p * ranges / count).min(ranges - 1);
+    let buckets: Vec<Vec<Vec<u64>>> = par::run(threads, parsed.len(), |_| Vec::new(), |done: &mut Vec<(usize, Vec<Vec<u64>>)>, t| {
+        let mut b: Vec<Vec<u64>> = (0..ranges).map(|_| Vec::new()).collect();
+        for &e in &parsed[t].inner_links {
+            b[range_of((e >> 18) as usize)].push(e);
+        }
+        done.push((t, b));
+    })
+    .into_iter()
+    .flatten()
+    .fold((0..parsed.len()).map(|_| Vec::new()).collect::<Vec<_>>(), |mut acc, (t, b)| {
+        acc[t] = b;
+        acc
+    });
     let general_links: Vec<Vec<(Id, Id)>> = par::run(threads, ranges, |_| Vec::new(), |general, r| {
-        let (lo, hi) = (count * r / ranges, count * (r + 1) / ranges);
-        let mine = |e: u64| {
-            let p = (e >> 18) as usize;
-            (lo..hi).contains(&p)
-        };
-        for t in parsed {
-            for &e in &t.inner_links {
-                if mine(e) && ((e >> 9) & 511 >= 16 || e & 511 >= 16) {
-                    unsafe { *fp.at((e >> 18) as usize) |= BIG };
-                }
+        let (lo, hi) = ((r * count).div_ceil(ranges), ((r + 1) * count).div_ceil(ranges));
+        let mine = || buckets.iter().flat_map(|b| b[r].iter().copied());
+        for e in mine() {
+            if (e >> 9) & 511 >= 16 || e & 511 >= 16 {
+                unsafe { *fp.at((e >> 18) as usize) |= BIG };
             }
         }
-        for t in parsed {
-            for &e in &t.inner_links {
-                if !mine(e) {
-                    continue;
-                }
-                let p = (e >> 18) as usize;
-                let (a, b) = (((e >> 9) & 511) as u32, (e & 511) as u32);
-                if unsafe { *fp.at(p) } & (OUTER | BIG) != 0 {
-                    let v = (p as u64) << 9;
-                    general.push((id_of(b'u', v | a as u64, user_key), id_of(b'u', v | b as u64, user_key)));
-                    continue;
-                }
-                let par = unsafe { pp.at(p) };
-                let (ra, rb) = (nib_find(*par, a), nib_find(*par, b));
-                if ra != rb {
-                    let (lo_r, hi_r) = (ra.min(rb), ra.max(rb));
-                    *par = *par & !(15u64 << (4 * hi_r)) | (lo_r as u64) << (4 * hi_r);
-                }
+        for e in mine() {
+            let p = (e >> 18) as usize;
+            let (a, b) = (((e >> 9) & 511) as u32, (e & 511) as u32);
+            if unsafe { *fp.at(p) } & (OUTER | BIG) != 0 {
+                let v = (p as u64) << 9;
+                general.push((id_of(b'u', v | a as u64, user_key), id_of(b'u', v | b as u64, user_key)));
+                continue;
+            }
+            let par = unsafe { pp.at(p) };
+            let (ra, rb) = (nib_find(*par, a), nib_find(*par, b));
+            if ra != rb {
+                let (lo_r, hi_r) = (ra.min(rb), ra.max(rb));
+                *par = *par & !(15u64 << (4 * hi_r)) | (lo_r as u64) << (4 * hi_r);
             }
         }
         for p in lo..hi {
@@ -1065,6 +1069,10 @@ fn people(parsed: &[Parsed], count: usize, user_key: u64, threads: usize) -> Peo
                 continue;
             }
             let par = unsafe { *pp.at(p) };
+            if par == IDENTITY {
+                unsafe { *sp.at(p) = 1 };
+                continue;
+            }
             let root = nib_find(par, 0);
             let mut mask = 0u16;
             for a in 0..16 {
@@ -1538,27 +1546,60 @@ pub fn run(inp: &Inputs) -> Res<bool> {
     for (part, out) in click_out.into_iter().flatten() {
         click_parts_out[part] = Some(out);
     }
-    let mut all_clicks: Vec<Click> = Vec::with_capacity(click_parts_out.iter().flatten().map(|c| c.clicks.len()).sum());
-    let mut previous = 0u32;
-    for out in click_parts_out.iter_mut().flatten() {
-        if let Some(first) = out.clicks.first() {
-            if first.person < previous {
+    let parts: Vec<ClickPart> = click_parts_out.into_iter().flatten().filter(|c| !c.clicks.is_empty() || !c.slow.is_empty()).collect();
+    // Laid out end to end in number order (so by person), in parallel; each person's run is
+    // `click_start[p]..click_end[p]`, written by the partitions where it starts and ends.
+    let mut offsets = Vec::with_capacity(parts.len() + 1);
+    offsets.push(0usize);
+    let (mut prev_last, mut next_first) = (vec![u32::MAX; parts.len()], vec![u32::MAX; parts.len()]);
+    let mut last_seen: Option<u32> = None;
+    for (i, part) in parts.iter().enumerate() {
+        offsets.push(offsets[i] + part.clicks.len());
+        if let (Some(first), Some(last)) = (part.clicks.first(), part.clicks.last()) {
+            if last_seen.is_some_and(|l| first.person < l) {
                 give_up("clicks out of person order");
             }
-            previous = out.clicks.last().unwrap().person;
+            prev_last[i] = last_seen.unwrap_or(u32::MAX);
+            last_seen = Some(last.person);
+        } else {
+            prev_last[i] = last_seen.unwrap_or(u32::MAX);
         }
-        all_clicks.extend_from_slice(&out.clicks);
-        slow_clicks.append(&mut out.slow);
     }
-    drop(click_parts_out);
-    // Where each person's clicks are.
-    let mut click_start = vec![0u32; person_count + 1];
-    for c in &all_clicks {
-        click_start[c.person as usize + 1] += 1;
+    let mut first_seen: Option<u32> = None;
+    for (i, part) in parts.iter().enumerate().rev() {
+        next_first[i] = first_seen.unwrap_or(u32::MAX);
+        if let Some(first) = part.clicks.first() {
+            first_seen = Some(first.person);
+        }
     }
-    for p in 0..person_count {
-        click_start[p + 1] += click_start[p];
+    let total = offsets[parts.len()];
+    let mut all_clicks: Vec<Click> = Vec::with_capacity(total);
+    let mut click_start = vec![0u32; person_count];
+    let mut click_end = vec![0u32; person_count];
+    {
+        let (ap, sp, ep) = (SendPtr(all_clicks.as_mut_ptr()), SendPtr(click_start.as_mut_ptr()), SendPtr(click_end.as_mut_ptr()));
+        par::run(threads, parts.len(), |_| (), |_, i| {
+            let clicks = &parts[i].clicks;
+            let off = offsets[i];
+            for (j, c) in clicks.iter().enumerate() {
+                unsafe { *ap.at(off + j) = *c };
+                let before = if j == 0 { prev_last[i] } else { clicks[j - 1].person };
+                let after = if j + 1 == clicks.len() { next_first[i] } else { clicks[j + 1].person };
+                if before != c.person {
+                    unsafe { *sp.at(c.person as usize) = (off + j) as u32 };
+                }
+                if after != c.person {
+                    unsafe { *ep.at(c.person as usize) = (off + j + 1) as u32 };
+                }
+            }
+        });
+        unsafe { all_clicks.set_len(total) };
     }
+    let mut parts = parts;
+    for part in &mut parts {
+        slow_clicks.append(&mut part.slow);
+    }
+    drop(parts);
     if let Some(why) = given_up() {
         eprintln!("dense: {why}");
         return Ok(false);
@@ -1621,7 +1662,7 @@ pub fn run(inp: &Inputs) -> Res<bool> {
         if !sorted {
             events.sort_unstable();
         }
-        let range = click_start[p as usize] as usize..click_start[p as usize + 1] as usize;
+        let range = click_start[p as usize] as usize..click_end[p as usize] as usize;
         let extra: &[u128] = if people.flags[p as usize] & EXTRA != 0 { extra_clicks.get(&p).map_or(&[], |v| v.as_slice()) } else { &[] };
         let mut keys = std::mem::take(&mut s.clicks);
         click_keys(&all_clicks[range], cx.keys.click, extra, &mut keys);

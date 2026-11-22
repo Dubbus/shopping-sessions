@@ -1726,7 +1726,11 @@ pub fn run(inp: &Inputs) -> Res<bool> {
     let started = std::time::Instant::now();
     let mut lap = std::time::Instant::now();
     let mut log = |stage: &str| {
-        eprintln!("dense {stage:<10} {:>8.1} ms", lap.elapsed().as_secs_f64() * 1e3);
+        let rss = std::fs::read_to_string("/proc/self/status").ok().and_then(|s| {
+            let line = s.lines().find(|l| l.starts_with("RssAnon:"))?;
+            line.split_whitespace().nth(1)?.parse::<u64>().ok()
+        });
+        eprintln!("dense {stage:<10} {:>8.1} ms  anon {} MB", lap.elapsed().as_secs_f64() * 1e3, rss.unwrap_or(0) / 1024);
         lap = std::time::Instant::now();
     };
     let threads = inp.threads;

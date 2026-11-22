@@ -96,3 +96,21 @@ Container on ss-bench (Cascade Lake, scorer flags, 20M): 1.33-1.35 s median. 60M
   except events (container start, reading the files, clicks, links, people, an empty write)
   is therefore ~0.38 s container = ~0.36 board. With event parsing and the whole event stage
   free, this design still cannot reach 0.30.
+
+## Branch `dense`, night (2026-11-21, 19:15 onward)
+
+- Reference sweep seeds 620-699 at 200k: 80/80 agree (100 seeds in all, dense path taken).
+- Kept, each verified (dev + 20M MATCH on ss-bench) and timed natively:
+  links bucketed by person range (people 27 -> 9.5 ms), clicks laid out in parallel (40 -> 23),
+  smaller key sample (16 -> 9): 671 -> 620 ms. Event ts + ingest_ts eight at a time in
+  AVX-512 (`ts8`, exact vs ts::parse over 300k random batches; other shapes scalar):
+  parse 402 -> 380, total 598. Parallel MADV_DONTNEED of arenas and input before exit:
+  wall -6 ms. Click ts through ts8: -2 ms.
+- Measured, not kept: two-window event cut (first commas by tzcnt, last by lzcnt, per-field
+  quote bits): parse 378 -> 436 ms (an unpredictable per-field window choice).
+- Splits (8 threads, 20M): parse = read/newlines/clicks/links 115 + cut 88 + IDs/ingest 78 +
+  ts/validity/record 91 + push 33. Events stage 124 = place/walk 40 + click keys 14 +
+  names 8 + Sess::person 63 (hot lines: campaign-day cell, assist loop). Timestamps' ceiling
+  (both replaced by constants): 75 ms.
+- `dac6907`: container median 0.774 s (7 runs) -> board ~0.73; sweep 720-739 at 2M 20/20,
+  none gave up; 60M 1.78 s, RSS 9.6 GB, MATCH.

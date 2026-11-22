@@ -114,3 +114,14 @@ Container on ss-bench (Cascade Lake, scorer flags, 20M): 1.33-1.35 s median. 60M
   (both replaced by constants): 75 ms.
 - `dac6907`: container median 0.774 s (7 runs) -> board ~0.73; sweep 720-739 at 2M 20/20,
   none gave up; 60M 1.78 s, RSS 9.6 GB, MATCH.
+- **Board: 2840da6 scored 0.7299** (predicted 0.73).
+- Kept: event lines gathered into columns at the cut and decoded/validated eight at a time
+  (careful path for purchases and odd lines): parse 379 -> 370; no batch copy + click columns:
+  -> 352. `c5ad84e`: native ~576 ms, container median 0.759 s (board ~0.71); sweep 740-759
+  20/20.
+- Dropped (measured): overlapping user_daily writing with the stitch (stitch 19 -> 40 ms, no
+  net gain); branch-free two-window cut (parse 355 -> 398 ms); huge pages off for arenas
+  (-2 ms, noise level).
+- Where 576 ms goes (8 threads): parse 352 = read/clicks/links 106 + cut 82 + gather/decode/
+  validate 130 + push 35; events 124; write 33; clicks 23; stitch 19; people 9.5; keys 9.
+  Per event line, all stages: ~970 instructions / ~384 cycles single-thread.

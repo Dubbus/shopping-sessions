@@ -125,3 +125,14 @@ Container on ss-bench (Cascade Lake, scorer flags, 20M): 1.33-1.35 s median. 60M
 - Where 576 ms goes (8 threads): parse 352 = read/clicks/links 106 + cut 82 + gather/decode/
   validate 130 + push 35; events 124; write 33; clicks 23; stitch 19; people 9.5; keys 9.
   Per event line, all stages: ~970 instructions / ~384 cycles single-thread.
+- **Express Lane measured on ss-bench (public repo 42e53ab, its XL_TIMING=1):** 186 ms wall,
+  parse 140 (links/click index overlapped), events 34, write 5.5, peak RSS 540 MB, output MATCH.
+  Ours at the time: 576 ms, 3.4 GB. Their per-person work ~124 thread-ms vs ours ~1000.
+- Session pass split (20M): credited cell 15 ms, assists 19, rows 25 (+31 write); session and
+  click-window logic small. Kept: hash-free user_id dictionary + direct-table small ints
+  (write 33 -> 27.5), rows reserved (events 125 -> 119), day by next-midnight compare and
+  16-byte campaign cells (~2 ms), scatter block 8 KB (parse 355 -> 346, anon -330 MB),
+  purchases on the column path (~1 ms).
+- Anonymous memory after each stage now logged: parse 984 -> 654 MB with 8 KB blocks.
+- `cd313f2`: native ~558 ms, container median 0.727 s (board ~0.68); sweep 760-779 20/20;
+  60M MATCH.

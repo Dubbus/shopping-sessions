@@ -1534,6 +1534,8 @@ struct SessCx<'a> {
     days: usize,
     organic: usize,
     category_rank: &'a [u32],
+    /// Benchmarking only: 25 skips the credited cell, 26 the assists, 27 the rows.
+    dx: u32,
 }
 
 /// Per-thread aggregation state, as in main.rs's sessions stage.
@@ -1572,7 +1574,8 @@ impl Sess {
         let (mut row_sessions, mut row_events, mut row_revenue) = (0i64, 0i64, 0i64);
         let rows = &mut self.rows;
         let mut flush = |day: i64, sessions: i64, events: i64, revenue: i64, categories: &mut Vec<(u32, u64)>| {
-            if sessions == 0 {
+            if sessions == 0 || cx.dx == 27 {
+                categories.clear();
                 return;
             }
             let top = categories
@@ -1648,12 +1651,16 @@ impl Sess {
             }
             let credited = if hi > lo { clicks[hi - 1] as u32 as usize } else { cx.organic };
             let day_index = (day - cx.first_day) as usize;
-            let cell = &mut self.campaign_days[credited * cx.days + day_index];
-            cell[0] += 1;
-            cell[1] += (revenue != 0) as u64;
-            cell[2] += revenue;
-            for &c in &self.active {
-                self.assisted[c as usize * cx.days + day_index] += 1;
+            if cx.dx != 25 {
+                let cell = &mut self.campaign_days[credited * cx.days + day_index];
+                cell[0] += 1;
+                cell[1] += (revenue != 0) as u64;
+                cell[2] += revenue;
+            }
+            if cx.dx != 26 {
+                for &c in &self.active {
+                    self.assisted[c as usize * cx.days + day_index] += 1;
+                }
             }
         }
         flush(row_day, row_sessions, row_events, row_revenue, &mut self.day_categories);
@@ -2056,7 +2063,7 @@ pub fn run(inp: &Inputs) -> Res<bool> {
     for (rank, &c) in by_name.iter().enumerate() {
         category_rank[c] = rank as u32;
     }
-    let scx = SessCx { base, first_day, days, organic: inp.organic, category_rank: &category_rank };
+    let scx = SessCx { base, first_day, days, organic: inp.organic, category_rank: &category_rank, dx: cx.dx };
 
     // People with odd-ID events: each must be finished once, with or without numbered events.
     let extra_done: HashMap<u32, std::sync::atomic::AtomicBool> = extra_events.keys().map(|&p| (p, std::sync::atomic::AtomicBool::new(false))).collect();

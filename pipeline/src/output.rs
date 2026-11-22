@@ -193,6 +193,43 @@ impl Chunk {
 
 // ---- The RLE / bit-packed hybrid ---------------------------------------------------------
 
+/// `id_chunk` for IDs whose equal values sit next to each other in `ids` (a person's rows
+/// are made together), written in `order`: dictionary entries are numbered as the names
+/// change, with no hashing. A name that came back later would only get a second, equal
+/// dictionary entry, which reads the same.
+fn grouped_id_chunk(ids: &[Id], order: &[u32]) -> Chunk {
+    let mut dictionary = Vec::with_capacity(ids.len() * 6);
+    let mut entry_of = Vec::with_capacity(ids.len());
+    let mut distinct = 0u32;
+    for (i, &id) in ids.iter().enumerate() {
+        if i == 0 || ids[i - 1] != id {
+            let start = dictionary.len();
+            dictionary.extend_from_slice(&[0; 4]);
+            key::write_bytes(id, &mut dictionary);
+            let len = (dictionary.len() - start - 4) as u32;
+            dictionary[start..start + 4].copy_from_slice(&len.to_le_bytes());
+            distinct += 1;
+        }
+        entry_of.push(distinct - 1);
+    }
+    let width = bit_width(distinct.saturating_sub(1));
+    let mut data = Vec::with_capacity(order.len() * 5 + 1);
+    data.push(width as u8);
+    let bytes = width.div_ceil(8) as usize;
+    let mut i = 0;
+    while i < order.len() {
+        let entry = entry_of[order[i] as usize];
+        let mut end = i + 1;
+        while end < order.len() && entry_of[order[end] as usize] == entry {
+            end += 1;
+        }
+        varint(&mut data, ((end - i) as u64) << 1);
+        data.extend_from_slice(&entry.to_le_bytes()[..bytes]);
+        i = end;
+    }
+    Chunk::dictionary_encoded(dictionary, distinct as usize, data, order.len())
+}
+
 fn bit_width(max: u32) -> u32 {
     (32 - max.leading_zeros()).max(1)
 }
@@ -324,7 +361,32 @@ fn slot_of(v: i64, capacity: usize) -> usize {
 
 /// An integer column: dictionary of the distinct values in first-seen order, each stored in
 /// `bytes` bytes.
-fn int_chunk(values: impl Iterator<Item = i64>, bytes: usize) -> Chunk {
+fn int_chunk(values: impl Iterator<Item = i64> + Clone, bytes: usize) -> Chunk {
+    // A small range of values: the dictionary index straight from an array, no hashing.
+    let (lo, hi) = values.clone().fold((i64::MAX, i64::MIN), |(lo, hi), v| (lo.min(v), hi.max(v)));
+    if lo <= hi && (hi - lo) < 1 << 16 {
+        let mut index_of = vec![0u32; (hi - lo + 1) as usize];
+        let mut dictionary = Vec::new();
+        let mut distinct = 0u32;
+        let mut indexes: Vec<u32> = Vec::with_capacity(values.size_hint().0);
+        for v in values {
+            let slot = &mut index_of[(v - lo) as usize];
+            if *slot == 0 {
+                distinct += 1;
+                *slot = distinct;
+                dictionary.extend_from_slice(&v.to_le_bytes()[..bytes]);
+            }
+            indexes.push(*slot - 1);
+        }
+        let width = bit_width(distinct.saturating_sub(1));
+        let mut data = vec![width as u8];
+        let mut hybrid = Hybrid::new(&mut data, width);
+        for &index in &indexes {
+            hybrid.push(index);
+        }
+        hybrid.finish();
+        return Chunk::dictionary_encoded(dictionary, distinct as usize, data, indexes.len());
+    }
     // Value -> dictionary index plus one (0 marks an empty slot). Open addressing.
     let mut table: Vec<(i64, u32)> = vec![(0, 0); 64];
     let mut dictionary = Vec::new();
@@ -651,10 +713,9 @@ pub fn write_user_daily(path: &Path, rows: &UserRows, categories: &[Str]) -> Res
     // Rows without purchases first: their revenue is one run of zeros and their category
     // one run of nulls. Every column is written in this order.
     let order = zeros_first(&rows.revenue_cents);
-    let user_id: Vec<Id> = order.iter().map(|&i| rows.user_id[i as usize]).collect();
     let top_category: Vec<u32> = order.iter().map(|&i| rows.top_category[i as usize]).collect();
     let chunks = vec![
-        id_chunk(&user_id),
+        grouped_id_chunk(&rows.user_id, &order),
         int_chunk(order.iter().map(|&i| rows.day[i as usize] as i64), 4),
         int_chunk(order.iter().map(|&i| rows.sessions[i as usize]), 8),
         int_chunk(order.iter().map(|&i| rows.events[i as usize]), 8),

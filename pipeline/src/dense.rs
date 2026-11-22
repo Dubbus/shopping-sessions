@@ -195,7 +195,8 @@ const DIM_BITS: u64 = {
 /// its length. Lanes of the usual shapes (F1: 20 bytes ending `Z`; F2: 25 bytes with a sign
 /// at 19; F3: 13 bytes) are parsed here exactly as `ts::parse` would; `ok` has the lanes
 /// that are valid. Every other lane, and year 0000, is in `odd`, for the scalar parser.
-/// `f1_only` (ingest_ts): only F1 counts, and other shapes are simply not ok.
+/// `f1_only` (ingest_ts): only F1 counts, other shapes are simply not ok, and the values are
+/// whole seconds instead of milliseconds.
 #[inline(always)]
 fn ts8(words: &[[u64; 8]; 4], lens: &[u64; 8], lanes: usize, f1_only: bool) -> ([i64; 8], u8, u8) {
     let live = if lanes >= 8 { 0xFF } else { (1u8 << lanes) - 1 };
@@ -270,7 +271,8 @@ fn ts8(words: &[[u64; 8]; 4], lens: &[u64; 8], lanes: usize, f1_only: bool) -> (
             secs = _mm512_mask_sub_epi64(secs, plus, secs, off);
             secs = _mm512_mask_add_epi64(secs, minus, secs, off);
         }
-        let mut ms = _mm512_mullo_epi64(secs, c(1000));
+        // Ingest mode (F1 only) returns whole seconds, ts mode milliseconds.
+        let mut ms = if f1_only { secs } else { _mm512_mullo_epi64(secs, c(1000)) };
         let year0 = (f1 | f2) & eq(y, 0);
         let mut odd = 0u8;
         if f1_only {
@@ -866,67 +868,165 @@ unsafe fn event_cols(out: &mut Parsed, cx: &Cx) {
     let mut c = out.ecol_spare.take().unwrap();
     std::mem::swap(&mut c, &mut out.ecol);
     let n = c.n;
-    let (ev_no, ev_ok) = decode8(&c.eid_w, &c.eid_n, cx.keys.event);
-    let (us_no, us_ok) = decode8(&c.uid_w, &c.uid_n, cx.keys.user);
-    let ts = ts8(&c.ts_w, &c.ts_n, n, false);
-    let ing = ts8(&c.ing_w, &c.ing_n, n, true);
+    let d = decode_cols(&c, cx);
+    let r = records8(&c, cx, &d);
+    if r.out_of_range {
+        give_up("ingest_ts out of the stored range");
+    }
+    out.max_person = out.max_person.max(r.max_person);
     for lane in 0..n {
         let bit = |m: u8| m >> lane & 1 != 0;
-        let number = ev_no[lane];
-        let user_empty = c.user_len[lane] == 0;
-        let kind4 = c.kind_n[lane] == 4 && (c.kind_w[lane] as u32 as u64 == VIEW || c.kind_w[lane] as u32 as u64 == CART);
-        let purchase = c.kind_n[lane] == 8 && c.kind_w[lane] == PURCHASE;
-        let user_no = if user_empty { SLOW } else { dense_user(us_no[lane], bit(us_ok)) };
-        let careful = !bit(ev_ok) || number >= cx.ecap || bit(ts.2) || bit(ing.2) || (!user_empty && user_no == SLOW);
-        if careful {
+        if bit(r.careful) {
             unsafe { event_careful(out, cx, c.line[lane], c.len[lane] as usize) };
             continue;
         }
-        // The rules promise a valid F1 ingest_ts; a copy without one is dropped.
-        if !bit(ing.1) {
+        if !bit(r.keep) {
             continue;
         }
-        let ingest = ing.0[lane] / 1000;
-        let t = ts.0[lane];
-        let valid = !user_empty
-            && c.prod_len[lane] != 0
-            && bit(ts.1)
-            && t >= cx.window_start
-            && t < cx.window_end
-            && ingest * 1000 - t <= DAY_MS
-            && (kind4 || purchase);
-        // A purchase also needs a valid price; its category comes from the product.
-        let mut extra = 0u64;
-        let valid = valid && (!purchase || {
+        let (mut a, mut b) = (r.a[lane], r.b[lane]);
+        // A valid purchase also needs a valid price; its category comes from the product.
+        if bit(r.purchase) {
             match parse_price(unsafe { std::slice::from_raw_parts(c.price[lane], c.price_len[lane] as usize) }) {
                 Some(cents) => {
                     let product = unsafe { std::slice::from_raw_parts(c.prod[lane], c.prod_len[lane] as usize) };
-                    extra = (cx.products.category(product) as u64) << 24 | cents as u64;
-                    true
+                    a |= (cx.products.category(product) as u64) << 24 | cents as u64;
                 }
-                None => false,
+                None => b = 0,
             }
-        });
-        let ing_rel = ingest - cx.ing_base;
-        if !(0..ING_LIMIT).contains(&ing_rel) {
-            give_up("ingest_ts out of the stored range");
-            continue;
         }
-        let a = (ing_rel as u64) << 43 | (number & SLOT_MASK) << 29 | if valid { extra } else { 0 };
-        let b = if valid {
-            out.max_person = out.max_person.max(user_no >> 9);
-            1u64 << 63 | ((t - cx.base) as u64) << 32 | user_no as u64
-        } else {
-            0
-        };
         if cx.dx == 3 {
             std::hint::black_box((a, b));
             continue;
         }
-        out.events.as_mut().unwrap().push((number >> SLOT_BITS) as usize, EvRec { a, b });
+        out.events.as_mut().unwrap().push(r.part[lane] as usize, EvRec { a, b });
     }
     c.n = 0;
     out.ecol_spare = Some(c);
+}
+
+/// The decoded columns of a batch.
+struct Decoded {
+    ev_no: [u64; 8],
+    ev_ok: u8,
+    us_no: [u64; 8],
+    us_ok: u8,
+    /// Milliseconds, ok, odd.
+    ts: ([i64; 8], u8, u8),
+    /// Seconds, ok, odd.
+    ing: ([i64; 8], u8, u8),
+}
+
+#[inline(always)]
+fn decode_cols(c: &EvCols, cx: &Cx) -> Decoded {
+    let (ev_no, ev_ok) = decode8(&c.eid_w, &c.eid_n, cx.keys.event);
+    let (us_no, us_ok) = decode8(&c.uid_w, &c.uid_n, cx.keys.user);
+    Decoded { ev_no, ev_ok, us_no, us_ok, ts: ts8(&c.ts_w, &c.ts_n, c.n, false), ing: ts8(&c.ing_w, &c.ing_n, c.n, true) }
+}
+
+/// The records of a batch, before purchases get their price.
+#[derive(PartialEq, Debug)]
+struct Records8 {
+    a: [u64; 8],
+    b: [u64; 8],
+    part: [u64; 8],
+    /// Lanes for `event_careful`; lanes to push; valid purchases (b set, price still to check).
+    careful: u8,
+    keep: u8,
+    purchase: u8,
+    max_person: u32,
+    out_of_range: bool,
+}
+
+/// Everything `event_rest` decides for a lane, for the eight lanes at once: which lanes need
+/// the careful path, which are dropped (no valid ingest_ts), validity, and the two record
+/// words. Purchases are marked valid here and checked for their price after.
+#[inline(always)]
+fn records8(c: &EvCols, cx: &Cx, d: &Decoded) -> Records8 {
+    let live = if c.n >= 8 { 0xFF } else { (1u8 << c.n) - 1 };
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "avx512dq"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        let k = |v: i64| _mm512_set1_epi64(v);
+        let ld = |a: &[u64; 8]| _mm512_loadu_si512(a.as_ptr() as *const _);
+        let ldi = |a: &[i64; 8]| _mm512_loadu_si512(a.as_ptr() as *const _);
+        let ld32 = |a: &[u32; 8]| _mm512_cvtepu32_epi64(_mm256_loadu_si256(a.as_ptr() as *const _));
+        let (ev_no, us_no) = (ld(&d.ev_no), ld(&d.us_no));
+        let (t, secs) = (ldi(&d.ts.0), ldi(&d.ing.0));
+        let user_len = ld32(&c.user_len);
+        let prod_len = ld32(&c.prod_len);
+        let (kind_w, kind_n) = (ld(&c.kind_w), ld(&c.kind_n));
+        let user_nonempty = _mm512_test_epi64_mask(user_len, user_len);
+        let user_slow = !d.us_ok | _mm512_cmpge_epu64_mask(us_no, k(((PERSON_LIMIT as u64) << 9) as i64));
+        let careful = (!d.ev_ok | _mm512_cmpge_epu64_mask(ev_no, k(cx.ecap as i64)) | d.ts.2 | d.ing.2 | (user_nonempty & user_slow)) & live;
+        let keep = d.ing.1 & !careful & live;
+        let low32 = _mm512_and_si512(kind_w, k(0xFFFF_FFFF));
+        let kind4 = _mm512_cmpeq_epi64_mask(kind_n, k(4)) & (_mm512_cmpeq_epi64_mask(low32, k(VIEW as i64)) | _mm512_cmpeq_epi64_mask(low32, k(CART as i64)));
+        let purchase = _mm512_cmpeq_epi64_mask(kind_n, k(8)) & _mm512_cmpeq_epi64_mask(kind_w, k(PURCHASE as i64));
+        let window = _mm512_cmpge_epi64_mask(t, k(cx.window_start)) & _mm512_cmplt_epi64_mask(t, k(cx.window_end));
+        let late_ok = _mm512_cmple_epi64_mask(_mm512_sub_epi64(_mm512_mullo_epi64(secs, k(1000)), t), k(DAY_MS));
+        let valid = keep & user_nonempty & _mm512_test_epi64_mask(prod_len, prod_len) & d.ts.1 & window & late_ok & (kind4 | purchase);
+        let ing_rel = _mm512_sub_epi64(secs, k(cx.ing_base));
+        let in_range = _mm512_cmpge_epi64_mask(ing_rel, k(0)) & _mm512_cmplt_epi64_mask(ing_rel, k(ING_LIMIT));
+        let a = _mm512_or_si512(_mm512_slli_epi64::<43>(ing_rel), _mm512_slli_epi64::<29>(_mm512_and_si512(ev_no, k(SLOT_MASK as i64))));
+        let b = _mm512_or_si512(
+            _mm512_or_si512(k(i64::MIN), _mm512_slli_epi64::<32>(_mm512_sub_epi64(t, k(cx.base)))),
+            _mm512_and_si512(us_no, k(0xFFFF_FFFF)),
+        );
+        let b = _mm512_maskz_mov_epi64(valid, b);
+        let part = _mm512_srli_epi64::<14>(ev_no);
+        let max_person = _mm512_mask_reduce_max_epu64(valid, _mm512_srli_epi64::<9>(us_no)) as u32;
+        let mut r = Records8 { a: [0; 8], b: [0; 8], part: [0; 8], careful, keep, purchase: purchase & valid, max_person, out_of_range: keep & !in_range != 0 };
+        _mm512_storeu_si512(r.a.as_mut_ptr() as *mut _, a);
+        _mm512_storeu_si512(r.b.as_mut_ptr() as *mut _, b);
+        _mm512_storeu_si512(r.part.as_mut_ptr() as *mut _, part);
+        r
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "avx512dq")))]
+    records8_scalar(c, cx, d, live)
+}
+
+/// `records8`, one lane at a time: the plain statement of it, and what other CPUs run.
+#[cfg_attr(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "avx512dq"), allow(dead_code))]
+fn records8_scalar(c: &EvCols, cx: &Cx, d: &Decoded, live: u8) -> Records8 {
+    let mut r = Records8 { a: [0; 8], b: [0; 8], part: [0; 8], careful: 0, keep: 0, purchase: 0, max_person: 0, out_of_range: false };
+    for lane in 0..8 {
+        if live >> lane & 1 == 0 {
+            continue;
+        }
+        let bit = |m: u8| m >> lane & 1 != 0;
+        let user_empty = c.user_len[lane] == 0;
+        let user_slow = !bit(d.us_ok) || d.us_no[lane] >= (PERSON_LIMIT as u64) << 9;
+        if !bit(d.ev_ok) || d.ev_no[lane] >= cx.ecap || bit(d.ts.2) || bit(d.ing.2) || (!user_empty && user_slow) {
+            r.careful |= 1 << lane;
+            continue;
+        }
+        if !bit(d.ing.1) {
+            continue;
+        }
+        r.keep |= 1 << lane;
+        let (t, secs) = (d.ts.0[lane], d.ing.0[lane]);
+        let kind4 = c.kind_n[lane] == 4 && (c.kind_w[lane] as u32 as u64 == VIEW || c.kind_w[lane] as u32 as u64 == CART);
+        let purchase = c.kind_n[lane] == 8 && c.kind_w[lane] == PURCHASE;
+        let valid = !user_empty
+            && c.prod_len[lane] != 0
+            && bit(d.ts.1)
+            && t >= cx.window_start
+            && t < cx.window_end
+            && secs * 1000 - t <= DAY_MS
+            && (kind4 || purchase);
+        let ing_rel = secs - cx.ing_base;
+        r.out_of_range |= !(0..ING_LIMIT).contains(&ing_rel);
+        r.a[lane] = (ing_rel as u64) << 43 | (d.ev_no[lane] & SLOT_MASK) << 29;
+        r.part[lane] = d.ev_no[lane] >> SLOT_BITS;
+        if valid {
+            r.b[lane] = 1u64 << 63 | ((t - cx.base) as u64) << 32 | (d.us_no[lane] & 0xFFFF_FFFF);
+            r.max_person = r.max_person.max((d.us_no[lane] >> 9) as u32);
+            if purchase {
+                r.purchase |= 1 << lane;
+            }
+        }
+    }
+    r
 }
 
 /// One event line the careful way: cut again, everything scalar, exactly as before.
@@ -958,7 +1058,7 @@ unsafe fn event_batch(out: &mut Parsed, cx: &Cx) {
         let user_no = dense_user(us_no[lane], us_ok >> lane & 1 != 0);
         let bit = |m: u8| m >> lane & 1 != 0;
         let t = if bit(ts.2) { Pre::Odd } else if bit(ts.1) { Pre::Some(ts.0[lane]) } else { Pre::None };
-        let i = if bit(ing.2) { Pre::Odd } else if bit(ing.1) { Pre::Some(ing.0[lane] / 1000) } else { Pre::None };
+        let i = if bit(ing.2) { Pre::Odd } else if bit(ing.1) { Pre::Some(ing.0[lane]) } else { Pre::None };
         unsafe { event_rest(out, cx, b.p[lane], &b.f[lane], number, user_no, t, i) };
     }
 }
@@ -2499,6 +2599,58 @@ mod tests {
     }
 
     #[test]
+    fn records8_matches_scalar() {
+        let campaigns = Campaigns::default();
+        let ws = 1_790_812_800_000i64;
+        let cx = Cx {
+            keys: Keys { user: 1, event: 2, click: 3 },
+            window_start: ws,
+            window_end: ws + 14 * DAY_MS,
+            base: ws - WEEK_MS,
+            ing_base: ws / 1000 - 86_400,
+            ecap: 1 << 22,
+            ccap: 1 << 20,
+            products: Products { by_number: Vec::new(), others: StrMap::default(), unknown: 0 },
+            campaigns: &campaigns,
+            dx: 0,
+        };
+        let mut next = rng(0xABCD_EF01_2345_6789);
+        for _ in 0..200_000 {
+            let mut c = EvCols::default();
+            c.n = 1 + (next() % 8) as usize;
+            let mut d = Decoded { ev_no: [0; 8], ev_ok: (next() | next()) as u8, us_no: [0; 8], us_ok: (next() | next()) as u8, ts: ([0; 8], next() as u8 | next() as u8, if next() % 4 == 0 { next() as u8 } else { 0 }), ing: ([0; 8], next() as u8 | next() as u8, if next() % 4 == 0 { next() as u8 } else { 0 }) };
+            for lane in 0..8 {
+                d.ev_no[lane] = next() % (cx.ecap + cx.ecap / 8);
+                d.us_no[lane] = if next() % 30 == 0 { next() % (1 << 40) } else { next() % (1 << 30) };
+                let t = ws - 2 * DAY_MS + (next() % (18 * DAY_MS as u64)) as i64;
+                d.ts.0[lane] = t;
+                d.ing.0[lane] = t / 1000 + (next() % 200_000) as i64 - 2000 + if next() % 500 == 0 { 40 * 86_400 } else { 0 };
+                c.user_len[lane] = if next() % 10 == 0 { 0 } else { 9 };
+                c.prod_len[lane] = if next() % 10 == 0 { 0 } else { 4 };
+                let (w, n) = match next() % 6 {
+                    0 => (VIEW, 4),
+                    1 => (CART, 4),
+                    2 => (PURCHASE, 8),
+                    3 => (VIEW | 1 << 40, 4),
+                    4 => (PURCHASE ^ 1, 8),
+                    _ => (VIEW, 5),
+                };
+                c.kind_w[lane] = w;
+                c.kind_n[lane] = n;
+            }
+            let live = if c.n >= 8 { 0xFF } else { (1u8 << c.n) - 1 };
+            let v = records8(&c, &cx, &d);
+            let s = records8_scalar(&c, &cx, &d, live);
+            assert_eq!((v.careful, v.keep, v.purchase, v.max_person, v.out_of_range), (s.careful, s.keep, s.purchase, s.max_person, s.out_of_range));
+            for lane in 0..8 {
+                if v.keep >> lane & 1 != 0 {
+                    assert_eq!((v.a[lane], v.b[lane], v.part[lane]), (s.a[lane], s.b[lane], s.part[lane]), "lane {lane}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn decode8_matches_scalar() {
         let mut next = rng(0xDEAD_BEEF_F00D_1234);
         let chars = b"0123456789abcdefghijklmnopqrstuvwxyzA_ \x80";
@@ -2579,7 +2731,7 @@ mod tests {
                         continue;
                     }
                     let want = if f1_only { if f.len() == 20 && f[19] == b'Z' { ts::parse(f) } else { None } } else { ts::parse(f) };
-                    let got = if ok >> lane & 1 != 0 { Some(ms[lane]) } else { None };
+                    let got = if ok >> lane & 1 != 0 { Some(if f1_only { ms[lane] * 1000 } else { ms[lane] }) } else { None };
                     assert_eq!(got, want, "{} f1_only {f1_only}", String::from_utf8_lossy(f));
                 }
             }

@@ -1745,12 +1745,21 @@ fn click_keys(clicks: &[Click], click_key: u64, extra: &[u128], out: &mut Vec<u1
 pub fn run(inp: &Inputs) -> Res<bool> {
     let started = std::time::Instant::now();
     let mut lap = std::time::Instant::now();
+    let cpu_ms = || {
+        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+        unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
+        (ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) as f64 * 1e3 + (ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) as f64 / 1e3
+    };
+    let mut cpu_lap = cpu_ms();
     let mut log = |stage: &str| {
         let rss = std::fs::read_to_string("/proc/self/status").ok().and_then(|s| {
             let line = s.lines().find(|l| l.starts_with("RssAnon:"))?;
             line.split_whitespace().nth(1)?.parse::<u64>().ok()
         });
-        eprintln!("dense {stage:<10} {:>8.1} ms  anon {} MB", lap.elapsed().as_secs_f64() * 1e3, rss.unwrap_or(0) / 1024);
+        let wall = lap.elapsed().as_secs_f64() * 1e3;
+        let cpu = cpu_ms();
+        eprintln!("dense {stage:<10} {wall:>8.1} ms  busy {:>4.1}  anon {} MB", (cpu - cpu_lap) / wall.max(0.001), rss.unwrap_or(0) / 1024);
+        cpu_lap = cpu;
         lap = std::time::Instant::now();
     };
     let threads = inp.threads;

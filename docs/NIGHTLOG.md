@@ -86,3 +86,13 @@ Container on ss-bench (Cascade Lake, scorer flags, 20M): 1.33-1.35 s median. 60M
   ts + validity 186 / 52. A 0.30 s board needs ~70 cycles per line in total.
 - Tried and dropped: chained lines (newline from each line's own second window, no newline
   pass): parse 407 -> 444 ms.
+- **Board: `ef4e258` scored 0.79** (predicted 0.77-0.82 from 0.842 s container x 0.94).
+- **Safety (ef4e258's code):** dense vs ordinary pipeline, 2M events, seeds 500-539: 40/40
+  MATCH, none gave up (`scripts/dense_sweep.sh`). Dense vs both Python references, 200k
+  events, seeds 600-699 (`sweep.py`), dense path confirmed taken. 60M (~/data60, ss-bench):
+  2.02 s warm (6.8 s cold cache), peak RSS 9.5 GB, MATCH vs ordinary (2.49 s).
+- **Ceiling (container, ss-bench, scorer flags, 5 interleaved pairs):** full run 0.838-0.852 s;
+  SS_DX=9 (event lines not even cut, so no event stage either) 0.377-0.383 s. Everything
+  except events (container start, reading the files, clicks, links, people, an empty write)
+  is therefore ~0.38 s container = ~0.36 board. With event parsing and the whole event stage
+  free, this design still cannot reach 0.30.

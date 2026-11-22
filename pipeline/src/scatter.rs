@@ -18,6 +18,9 @@ pub static REUSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool:
 /// Pooled blocks, all exactly `BLOCK` bytes and 64-byte aligned.
 static POOL: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 
+/// Every region an arena took, so a finished run can hand them back in parallel.
+pub static REGIONS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
 /// Hands out 64-byte-aligned memory from large regions. Nothing is ever returned.
 struct Arena {
     next: *mut u8,
@@ -36,6 +39,7 @@ impl Arena {
             unsafe {
                 libc::madvise(region as *mut _, size, libc::MADV_HUGEPAGE);
             }
+            REGIONS.lock().unwrap().push((region as usize, size));
             self.next = region;
             self.end = unsafe { region.add(size) };
         }

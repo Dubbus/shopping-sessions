@@ -930,22 +930,31 @@ unsafe fn click_batch(out: &mut Parsed, cx: &Cx) {
     let (uw, uc) = unsafe { id_words(&b, 1, b'u') };
     let (ck_no, ck_ok) = decode8(&kw, &kc, cx.keys.click);
     let (us_no, us_ok) = decode8(&uw, &uc, cx.keys.user);
+    let (tw, tl) = unsafe { ts_words(&b, 3) };
+    let ts = ts8(&tw, &tl, b.n, false);
     for lane in 0..b.n {
         let number = if ck_ok >> lane & 1 != 0 && ck_no[lane] < cx.ccap { Some(ck_no[lane]) } else { None };
         let user_no = dense_user(us_no[lane], us_ok >> lane & 1 != 0);
-        unsafe { click_rest(out, cx, b.p[lane], &b.f[lane], number, user_no) };
+        let bit = |m: u8| m >> lane & 1 != 0;
+        let t = if bit(ts.2) { Pre::Odd } else if bit(ts.1) { Pre::Some(ts.0[lane]) } else { Pre::None };
+        unsafe { click_rest(out, cx, b.p[lane], &b.f[lane], number, user_no, t) };
     }
 }
 
 #[inline(always)]
-unsafe fn click_rest(out: &mut Parsed, cx: &Cx, p: *const u8, f: &[(u32, u32); 7], number: Option<u64>, user_no: u32) {
+unsafe fn click_rest(out: &mut Parsed, cx: &Cx, p: *const u8, f: &[(u32, u32); 7], number: Option<u64>, user_no: u32, ts: Pre) {
     let field = |i: usize| unsafe { std::slice::from_raw_parts(p.add(f[i].0 as usize), (f[i].1 - f[i].0) as usize) };
     let (id, user) = (field(0), field(1));
     if id.is_empty() || user.is_empty() {
         return;
     }
     let Some(campaign) = cx.campaigns.get(field(2)) else { return };
-    let Some(t) = out.dates.parse(field(3)) else { return };
+    let t = match ts {
+        Pre::Some(v) => Some(v),
+        Pre::None => None,
+        Pre::Odd => out.dates.parse(field(3)),
+    };
+    let Some(t) = t else { return };
     if t < cx.base || t >= cx.window_end {
         return;
     }
@@ -2022,6 +2031,19 @@ pub fn run(inp: &Inputs) -> Res<bool> {
     // ---- Write
     write(inp, &sessions, days, first_day, campaign_count)?;
     log("write");
+    // Unless SS_EXIT=0: give the big mappings back on every thread, so the exit's teardown is short.
+    if std::env::var("SS_EXIT").map_or(true, |v| v != "0") {
+        let mut regions: Vec<(usize, usize)> = std::mem::take(&mut *crate::scatter::REGIONS.lock().unwrap());
+        regions.extend(maps.iter().flatten().map(|m| (m.as_ptr() as usize, m.len())));
+        let pieces: Vec<(usize, usize)> = regions
+            .iter()
+            .flat_map(|&(a, n)| (0..n.div_ceil(64 << 20)).map(move |k| (a + k * (64 << 20), (n - k * (64 << 20)).min(64 << 20))))
+            .collect();
+        par::run(threads, pieces.len(), |_| (), |_, i| unsafe {
+            libc::madvise(pieces[i].0 as *mut _, pieces[i].1, libc::MADV_DONTNEED);
+        });
+        log("release");
+    }
     eprintln!("dense total      {:>8.1} ms", started.elapsed().as_secs_f64() * 1e3);
     Ok(true)
 }

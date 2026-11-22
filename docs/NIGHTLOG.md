@@ -136,3 +136,12 @@ Container on ss-bench (Cascade Lake, scorer flags, 20M): 1.33-1.35 s median. 60M
 - Anonymous memory after each stage now logged: parse 984 -> 654 MB with 8 KB blocks.
 - `cd313f2`: native ~558 ms, container median 0.727 s (board ~0.68); sweep 760-779 20/20;
   60M MATCH.
+- Overlap ceiling measured: the run is busy 7.6 of 8 threads (idle ~25 ms in all). Fixed the
+  idle spots directly: stitch joins segments in its tasks, biggest first, slow groups per hash
+  bucket (19.7 -> 15.1 ms); keys found on a thread from the top of main while lookups load
+  (wall -7 ms). `b6dc63a`: container 0.719 s.
+- Line-kernel agent (ss-pmu, its own worktree): records8, validity and record words eight at a
+  time (290 -> 193 instr/line, 78 -> 57 cycles/line single-thread); ss-bench 8 threads parse
+  345 -> 304 ms. cut7 without data-dependent branches: parse ~305 -> ~297, wall ~525 -> ~516.
+- `93a5aa5`: gate 33 tests, 36/36, 169/172, dev + 20M MATCH; container median 0.673 s
+  (board ~0.63); sweep 800-819 20/20; 60M MATCH.

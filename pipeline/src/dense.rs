@@ -2246,35 +2246,29 @@ pub fn run(inp: &Inputs) -> Res<bool> {
     // ---- Stitch the people at partition edges, and the slow path
     let mut edges: Vec<Option<Edge>> = (0..eparts).map(|_| None).collect();
     let mut sessions: Vec<Sess> = Vec::new();
-    let mut slow_events = slow_events;
+    let mut slow_lists: Vec<Vec<(Id, u64)>> = vec![slow_events];
     for st in states {
         for (part, e) in st.edges {
             edges[part] = Some(e);
         }
-        slow_events.extend(st.slow);
+        slow_lists.push(st.slow);
         sessions.push(st.sess);
     }
-    let mut stitched: Vec<(u32, Vec<u64>, bool)> = Vec::new();
-    let mut last_person: Option<u32> = None;
+    // Segments in partition order (moved, not copied); one task per person, which joins its own.
+    let mut segments: Vec<Option<(Vec<u64>, bool)>> = Vec::new();
+    let mut tasks: Vec<(u32, usize, usize, usize)> = Vec::new(); // person, first segment, end, events
     for e in edges.into_iter().flatten() {
-        for seg in [e.first, e.last].into_iter().flatten() {
-            let (p, events, sorted) = seg;
-            match stitched.last_mut() {
+        for (p, events, sorted) in [e.first, e.last].into_iter().flatten() {
+            let n = events.len();
+            segments.push(Some((events, sorted)));
+            match tasks.last_mut() {
                 Some(top) if top.0 == p => {
-                    if let (Some(&a), Some(&b)) = (top.1.last(), events.first()) {
-                        top.2 &= a >> 32 <= b >> 32;
-                    }
-                    top.2 &= sorted;
-                    top.1.extend_from_slice(&events);
+                    top.2 += 1;
+                    top.3 += n;
                 }
-                _ => {
-                    if last_person.is_some_and(|l| p < l) {
-                        give_up("events out of person order at an edge");
-                    }
-                    stitched.push((p, events, sorted));
-                }
+                Some(top) if p < top.0 => give_up("events out of person order at an edge"),
+                _ => tasks.push((p, segments.len() - 1, segments.len(), n)),
             }
-            last_person = Some(p);
         }
     }
     if let Some(why) = given_up() {
@@ -2282,38 +2276,64 @@ pub fn run(inp: &Inputs) -> Res<bool> {
         return Ok(false);
     }
     for (&p, done) in &extra_done {
-        if !done.load(Ordering::Relaxed) && !stitched.iter().any(|s| s.0 == p) {
-            stitched.push((p, Vec::new(), true));
+        if !done.load(Ordering::Relaxed) && !tasks.iter().any(|t| t.0 == p) {
+            segments.push(Some((Vec::new(), true)));
+            tasks.push((p, segments.len() - 1, segments.len(), 0));
         }
     }
-    let stitched = Mutex::new(stitched.into_iter().map(Some).collect::<Vec<_>>());
-    let count = stitched.lock().unwrap().len();
-    // Slow groups, by name.
-    let mut groups: HashMap<Id, (Vec<u64>, Vec<u128>)> = HashMap::new();
-    for (name, ev) in slow_events {
-        groups.entry(name).or_default().0.push(ev);
-    }
-    for (name, k) in slow_clicks {
-        if let Some(g) = groups.get_mut(&name) {
-            g.1.push(k);
-        }
-    }
-    let groups: Vec<(Id, (Vec<u64>, Vec<u128>))> = groups.into_iter().collect();
-    let groups = Mutex::new(groups.into_iter().map(Some).collect::<Vec<_>>());
-    let gcount = groups.lock().unwrap().len();
-    let more = par::run(threads, count + gcount, |_| Sess::new(campaign_count, days, 0), |s, i| {
+    // The biggest people (whales) first, so none of them is the tail.
+    tasks.sort_unstable_by_key(|t| std::cmp::Reverse(t.3));
+    let segments = Mutex::new(segments);
+    let count = tasks.len();
+    // Slow groups by name, in buckets of the name's hash, each built by its own task.
+    let buckets = threads * 4;
+    let bucket_of = |name: Id| (key::hash(name) % buckets as u64) as usize;
+    let more = par::run(threads, count + buckets, |_| Sess::new(campaign_count, days, 0), |s, i| {
         if i < count {
-            let (p, mut events, sorted) = stitched.lock().unwrap()[i].take().unwrap();
+            let (p, from, to, n) = tasks[i];
+            let mut parts: Vec<(Vec<u64>, bool)> = {
+                let mut segs = segments.lock().unwrap();
+                (from..to).map(|k| segs[k].take().unwrap()).collect()
+            };
+            let (mut events, mut sorted) = parts.remove(0);
+            events.reserve(n - events.len());
+            for (more, more_sorted) in parts {
+                if let (Some(&a), Some(&b)) = (events.last(), more.first()) {
+                    sorted &= a >> 32 <= b >> 32;
+                }
+                sorted &= more_sorted;
+                events.extend_from_slice(&more);
+            }
             finish_person(s, p, &mut events, sorted);
         } else {
-            let (name, (mut events, mut clicks)) = groups.lock().unwrap()[i - count].take().unwrap();
-            events.sort_unstable();
-            if clicks.iter().any(|k| key::is_interned(!((*k >> 32) as u64))) {
-                clicks.sort_unstable_by(|&a, &b| ((a >> 96) as u32).cmp(&((b >> 96) as u32)).then_with(|| key::cmp_bytes(!((b >> 32) as u64), !((a >> 32) as u64))));
-            } else {
-                clicks.sort_unstable();
+            let b = i - count;
+            let mut groups: HashMap<Id, (Vec<u64>, Vec<u128>)> = HashMap::new();
+            for list in &slow_lists {
+                for &(name, ev) in list {
+                    if bucket_of(name) == b {
+                        groups.entry(name).or_default().0.push(ev);
+                    }
+                }
             }
-            s.person(&scx, name, &events, &clicks);
+            if groups.is_empty() {
+                return;
+            }
+            for &(name, k) in &slow_clicks {
+                if bucket_of(name) == b {
+                    if let Some(g) = groups.get_mut(&name) {
+                        g.1.push(k);
+                    }
+                }
+            }
+            for (name, (mut events, mut clicks)) in groups {
+                events.sort_unstable();
+                if clicks.iter().any(|k| key::is_interned(!((*k >> 32) as u64))) {
+                    clicks.sort_unstable_by(|&a, &b| ((a >> 96) as u32).cmp(&((b >> 96) as u32)).then_with(|| key::cmp_bytes(!((b >> 32) as u64), !((a >> 32) as u64))));
+                } else {
+                    clicks.sort_unstable();
+                }
+                s.person(&scx, name, &events, &clicks);
+            }
         }
     });
     sessions.extend(more);

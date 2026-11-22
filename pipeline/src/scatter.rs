@@ -10,7 +10,7 @@ use std::marker::PhantomData;
 const REGION: usize = 16 << 20;
 const HUGE: usize = 2 << 20;
 /// Target size of one block; the real size is a whole number of staging lines.
-const BLOCK: usize = 32 << 10;
+const BLOCK: usize = 4 << 10;
 
 /// On unless SS_NO_REUSE: blocks a stage has finished reading are pooled, and new blocks are taken from
 /// the pool before fresh memory (whose first touch makes the kernel zero it).

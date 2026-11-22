@@ -583,6 +583,62 @@ unsafe fn cut7(p: *const u8, len: usize, out: &mut [(u32, u32); 7]) -> bool {
     ok
 }
 
+/// Comma and quote masks of the 64 bytes at `p`.
+#[inline(always)]
+unsafe fn masks64(p: *const u8) -> (u64, u64) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        let v = _mm512_loadu_si512(p as *const _);
+        (_mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b',' as i8)), _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'"' as i8)))
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512bw")))]
+    {
+        let (mut c, mut q) = (0u64, 0u64);
+        for i in 0..64 {
+            let b = unsafe { *p.add(i) };
+            c |= ((b == b',') as u64) << i;
+            q |= ((b == b'"') as u64) << i;
+        }
+        (c, q)
+    }
+}
+
+/// `cut::<4>` for click lines of at most 62 bytes (nearly all), from one 64-bit window and
+/// without branches on the data; longer lines go to `cut`.
+#[inline(always)]
+unsafe fn cut4(p: *const u8, len: usize, out: &mut [(u32, u32); 4]) -> bool {
+    if len > 62 {
+        return unsafe { cut::<4>(p, len, out) };
+    }
+    let live = (1u64 << len) - 1;
+    let (c, q) = unsafe { masks64(p) };
+    let (c, q) = (c & live, q & live);
+    if c.count_ones() != 3 {
+        return false;
+    }
+    let c0 = c.trailing_zeros();
+    let r = c & (c - 1);
+    let c1 = r.trailing_zeros();
+    let r = r & (r - 1);
+    let c2 = r.trailing_zeros();
+    // Quotes, in positions shifted up by one, as in `cut`.
+    let q1 = q << 1;
+    let starts = c << 2 | 2;
+    let ends = c | 1u64 << len;
+    let (qs, qe) = (q1 & starts, q1 & ends);
+    let wrapped = pext(qs, starts);
+    let ok = (q1 == qs | qe) & (qs & qe == 0) & (wrapped == pext(qe, ends));
+    let pos = [c0, c1, c2, len as u32];
+    let mut from = 0u32;
+    for i in 0..4 {
+        let w = (wrapped >> i) as u32 & 1;
+        out[i] = (from + w, pos[i] - w);
+        from = pos[i] + 1;
+    }
+    ok
+}
+
 #[cold]
 fn cut_long<const N: usize>(line: &[u8], out: &mut [(u32, u32); N]) -> bool {
     let Some(fields) = csv::split::<N>(line) else { return false };
@@ -859,7 +915,7 @@ unsafe fn word(p: *const u8) -> u64 {
 
 #[inline(always)]
 unsafe fn event_line(out: &mut Parsed, cx: &Cx, p: *const u8, len: usize) {
-    if cx.dx == 9 {
+    if cx.dx == 9 || cx.dx == 42 {
         return;
     }
     let mut f = [(0u32, 0u32); 7];
@@ -1242,8 +1298,15 @@ impl Default for CkCols {
 
 #[inline(always)]
 unsafe fn click_line(out: &mut Parsed, cx: &Cx, p: *const u8, len: usize) {
+    if cx.dx == 40 || cx.dx == 42 {
+        return;
+    }
     let mut f = [(0u32, 0u32); 4];
-    if !unsafe { cut::<4>(p, len, &mut f) } {
+    if !unsafe { cut4(p, len, &mut f) } {
+        return;
+    }
+    if cx.dx == 41 {
+        std::hint::black_box(&f);
         return;
     }
     let c = &mut out.ccol;
@@ -1281,28 +1344,87 @@ unsafe fn click_cols(out: &mut Parsed, cx: &Cx) {
     let (ck_no, ck_ok) = decode8(&c.kid_w, &c.kid_n, cx.keys.click);
     let (us_no, us_ok) = decode8(&c.uid_w, &c.uid_n, cx.keys.user);
     let ts = ts8(&c.ts_w, &c.ts_n, n, false);
+    let r = ck_records8(&c, cx, &ck_no, ck_ok, &us_no, us_ok, &ts);
     for lane in 0..n {
         let bit = |m: u8| m >> lane & 1 != 0;
-        if c.user_len[lane] == 0 {
-            continue;
-        }
-        let number = ck_no[lane];
-        let user_no = dense_user(us_no[lane], bit(us_ok));
-        if !bit(ck_ok) || number >= cx.ccap || bit(ts.2) || user_no == SLOW {
+        if bit(r.careful) {
             unsafe { click_careful(out, cx, c.line[lane], c.len[lane] as usize) };
             continue;
         }
+        if !bit(r.keep) {
+            continue;
+        }
         let Some(campaign) = cx.campaigns.get(unsafe { std::slice::from_raw_parts(c.camp[lane], c.camp_len[lane] as usize) }) else { continue };
+        out.max_person = out.max_person.max((r.b[lane] >> 9) as u32);
+        out.clicks.as_mut().unwrap().push(r.part[lane] as usize, CkRec { a: r.a[lane] | (campaign as u64) << 32, b: r.b[lane] });
+    }
+    c.n = 0;
+    out.ccol_spare = Some(c);
+}
+
+/// Click records of a batch, before the campaign is looked up.
+struct CkRecords8 {
+    a: [u64; 8],
+    b: [u64; 8],
+    part: [u64; 8],
+    careful: u8,
+    keep: u8,
+}
+
+/// What `click_rest` decides for a lane, eight lanes at once: lanes for `click_careful`, lanes
+/// kept (user present, valid ts in the click window), and the record words without the campaign.
+#[inline(always)]
+fn ck_records8(c: &CkCols, cx: &Cx, ck_no: &[u64; 8], ck_ok: u8, us_no: &[u64; 8], us_ok: u8, ts: &([i64; 8], u8, u8)) -> CkRecords8 {
+    let live = if c.n >= 8 { 0xFF } else { (1u8 << c.n) - 1 };
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "avx512dq"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        let k = |v: i64| _mm512_set1_epi64(v);
+        let ld = |a: &[u64; 8]| _mm512_loadu_si512(a.as_ptr() as *const _);
+        let (m, u) = (ld(ck_no), ld(us_no));
+        let t = _mm512_loadu_si512(ts.0.as_ptr() as *const _);
+        let user_len = _mm512_cvtepu32_epi64(_mm256_loadu_si256(c.user_len.as_ptr() as *const _));
+        let present = _mm512_test_epi64_mask(user_len, user_len) & live;
+        let user_slow = !us_ok | _mm512_cmpge_epu64_mask(u, k(((PERSON_LIMIT as u64) << 9) as i64));
+        let careful = present & (!ck_ok | _mm512_cmpge_epu64_mask(m, k(cx.ccap as i64)) | ts.2 | user_slow);
+        let window = _mm512_cmpge_epi64_mask(t, k(cx.base)) & _mm512_cmplt_epi64_mask(t, k(cx.window_end));
+        let keep = present & !careful & ts.1 & window;
+        let a = _mm512_or_si512(_mm512_slli_epi64::<48>(_mm512_and_si512(m, k(SLOT_MASK as i64))), _mm512_sub_epi64(t, k(cx.base)));
+        let mut r = CkRecords8 { a: [0; 8], b: [0; 8], part: [0; 8], careful, keep };
+        _mm512_storeu_si512(r.a.as_mut_ptr() as *mut _, a);
+        _mm512_storeu_si512(r.b.as_mut_ptr() as *mut _, _mm512_and_si512(u, k(0xFFFF_FFFF)));
+        _mm512_storeu_si512(r.part.as_mut_ptr() as *mut _, _mm512_srli_epi64::<14>(m));
+        r
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "avx512dq")))]
+    ck_records8_scalar(c, cx, ck_no, ck_ok, us_no, us_ok, ts, live)
+}
+
+/// `ck_records8`, one lane at a time: the plain statement of it, and what other CPUs run.
+#[cfg_attr(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "avx512dq"), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+fn ck_records8_scalar(c: &CkCols, cx: &Cx, ck_no: &[u64; 8], ck_ok: u8, us_no: &[u64; 8], us_ok: u8, ts: &([i64; 8], u8, u8), live: u8) -> CkRecords8 {
+    let mut r = CkRecords8 { a: [0; 8], b: [0; 8], part: [0; 8], careful: 0, keep: 0 };
+    for lane in 0..8 {
+        let bit = |m: u8| m >> lane & 1 != 0;
+        if live >> lane & 1 == 0 || c.user_len[lane] == 0 {
+            continue;
+        }
+        let user_no = dense_user(us_no[lane], bit(us_ok));
+        if !bit(ck_ok) || ck_no[lane] >= cx.ccap || bit(ts.2) || user_no == SLOW {
+            r.careful |= 1 << lane;
+            continue;
+        }
         let t = ts.0[lane];
         if !bit(ts.1) || t < cx.base || t >= cx.window_end {
             continue;
         }
-        out.max_person = out.max_person.max(user_no >> 9);
-        let a = (number & SLOT_MASK) << 48 | (campaign as u64) << 32 | (t - cx.base) as u64;
-        out.clicks.as_mut().unwrap().push((number >> SLOT_BITS) as usize, CkRec { a, b: user_no as u64 });
+        r.keep |= 1 << lane;
+        r.a[lane] = (ck_no[lane] & SLOT_MASK) << 48 | (t - cx.base) as u64;
+        r.b[lane] = user_no as u64;
+        r.part[lane] = ck_no[lane] >> SLOT_BITS;
     }
-    c.n = 0;
-    out.ccol_spare = Some(c);
+    r
 }
 
 /// One click line the careful way: cut again, everything scalar.
@@ -2709,6 +2831,105 @@ mod tests {
             if let Some(w) = want {
                 for (o, f) in out.iter().zip(w) {
                     assert_eq!(&line[o.0 as usize..o.1 as usize], f, "{}", String::from_utf8_lossy(&line));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cut4_matches_split() {
+        let mut next = rng(0x1357_9BDF_2468_ACE0);
+        for round in 0..600_000 {
+            let mut line = Vec::new();
+            if round % 3 == 0 {
+                let len = (next() % 80) as usize;
+                line = (0..len).map(|_| b"ab,,\"\"x"[(next() % 7) as usize]).collect();
+            } else {
+                for i in 0..4 {
+                    if i > 0 {
+                        line.push(b',');
+                    }
+                    let n = match i {
+                        0 | 1 => 9,
+                        2 => 5,
+                        _ => [13usize, 20, 25][(next() % 3) as usize],
+                    };
+                    let n = if next() % 30 == 0 { (next() % 50) as usize } else { n };
+                    let quoted = next() % 5 == 0;
+                    if quoted {
+                        line.push(b'"');
+                    }
+                    for _ in 0..n {
+                        line.push(b"abc123:-TZ"[(next() % 10) as usize]);
+                    }
+                    if quoted {
+                        line.push(b'"');
+                    }
+                }
+                for _ in 0..(next() % 3) {
+                    if next() % 3 == 0 && !line.is_empty() {
+                        let at = (next() % line.len() as u64) as usize;
+                        match next() % 3 {
+                            0 => line[at] = b'"',
+                            1 => line[at] = b',',
+                            _ => {
+                                line.remove(at);
+                            }
+                        }
+                    }
+                }
+            }
+            let len = line.len();
+            let mut buf = line.clone();
+            buf.resize(len + 256, if round % 2 == 0 { b'"' } else { b',' });
+            let mut out = [(0u32, 0u32); 4];
+            let ok = unsafe { cut4(buf.as_ptr(), len, &mut out) };
+            let want = csv::split::<4>(&line);
+            assert_eq!(ok, want.is_some(), "{}", String::from_utf8_lossy(&line));
+            if let Some(w) = want {
+                for (o, f) in out.iter().zip(w) {
+                    assert_eq!(&line[o.0 as usize..o.1 as usize], f, "{}", String::from_utf8_lossy(&line));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ck_records8_matches_scalar() {
+        let campaigns = Campaigns::default();
+        let ws = 1_790_812_800_000i64;
+        let cx = Cx {
+            keys: Keys { user: 1, event: 2, click: 3 },
+            window_start: ws,
+            window_end: ws + 14 * DAY_MS,
+            base: ws - WEEK_MS,
+            ing_base: ws / 1000 - 86_400,
+            ecap: 1 << 22,
+            ccap: 1 << 20,
+            products: Products { by_number: Vec::new(), others: StrMap::default(), unknown: 0 },
+            campaigns: &campaigns,
+            dx: 0,
+        };
+        let mut next = rng(0x2468_ACE0_1357_9BDF);
+        for _ in 0..200_000 {
+            let mut c = CkCols::default();
+            c.n = 1 + (next() % 8) as usize;
+            let (mut ck_no, mut us_no) = ([0u64; 8], [0u64; 8]);
+            let mut ts = ([0i64; 8], next() as u8 | next() as u8, if next() % 4 == 0 { next() as u8 } else { 0 });
+            for lane in 0..8 {
+                ck_no[lane] = next() % (cx.ccap + cx.ccap / 8);
+                us_no[lane] = if next() % 30 == 0 { next() % (1 << 40) } else { next() % (1 << 30) };
+                ts.0[lane] = ws - 9 * DAY_MS + (next() % (25 * DAY_MS as u64)) as i64;
+                c.user_len[lane] = if next() % 10 == 0 { 0 } else { 9 };
+            }
+            let (ck_ok, us_ok) = ((next() | next()) as u8, (next() | next()) as u8);
+            let live = if c.n >= 8 { 0xFF } else { (1u8 << c.n) - 1 };
+            let v = ck_records8(&c, &cx, &ck_no, ck_ok, &us_no, us_ok, &ts);
+            let s = ck_records8_scalar(&c, &cx, &ck_no, ck_ok, &us_no, us_ok, &ts, live);
+            assert_eq!((v.careful, v.keep), (s.careful, s.keep));
+            for lane in 0..8 {
+                if v.keep >> lane & 1 != 0 {
+                    assert_eq!((v.a[lane], v.b[lane], v.part[lane]), (s.a[lane], s.b[lane], s.part[lane]), "lane {lane}");
                 }
             }
         }

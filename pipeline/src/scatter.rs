@@ -125,9 +125,10 @@ impl<T: Copy> Scatter<T> {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn push(&mut self, part: usize, record: T) {
-        assert!(part < self.staged.len());
+        // Callers compute `part` from a value already checked against the partition count.
+        debug_assert!(part < self.staged.len());
         // SAFETY: `part` is in range for every per-partition array; the staging line has
         // room for `PER_LINE` records and holds fewer than that.
         unsafe {

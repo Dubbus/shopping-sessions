@@ -783,9 +783,12 @@ struct EvCols {
     ing_n: [u64; 8],
     kind_w: [u64; 8],
     kind_n: [u64; 8],
-    /// Field lengths: user, product.
+    /// Field lengths: user, product; where product and price are, for purchases.
     user_len: [u32; 8],
     prod_len: [u32; 8],
+    prod: [*const u8; 8],
+    price: [*const u8; 8],
+    price_len: [u32; 8],
     line: [*const u8; 8],
     len: [u32; 8],
     n: usize,
@@ -840,6 +843,9 @@ unsafe fn event_line(out: &mut Parsed, cx: &Cx, p: *const u8, len: usize) {
         c.kind_w[n] = word(at(4));
         c.kind_n[n] = flen(4);
         c.prod_len[n] = flen(5) as u32;
+        c.prod[n] = at(5);
+        c.price[n] = at(6);
+        c.price_len[n] = flen(6) as u32;
     }
     c.line[n] = p;
     c.len[n] = len as u32;
@@ -850,6 +856,7 @@ unsafe fn event_line(out: &mut Parsed, cx: &Cx, p: *const u8, len: usize) {
 }
 
 const VIEW: u64 = u32::from_le_bytes(*b"view") as u64;
+const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
 const CART: u64 = u32::from_le_bytes(*b"cart") as u64;
 
 /// Decodes a column batch. Lines the fast path does not cover (purchases, IDs that are not
@@ -868,8 +875,9 @@ unsafe fn event_cols(out: &mut Parsed, cx: &Cx) {
         let number = ev_no[lane];
         let user_empty = c.user_len[lane] == 0;
         let kind4 = c.kind_n[lane] == 4 && (c.kind_w[lane] as u32 as u64 == VIEW || c.kind_w[lane] as u32 as u64 == CART);
+        let purchase = c.kind_n[lane] == 8 && c.kind_w[lane] == PURCHASE;
         let user_no = if user_empty { SLOW } else { dense_user(us_no[lane], bit(us_ok)) };
-        let careful = !bit(ev_ok) || number >= cx.ecap || bit(ts.2) || bit(ing.2) || (!user_empty && user_no == SLOW) || c.kind_n[lane] == 8;
+        let careful = !bit(ev_ok) || number >= cx.ecap || bit(ts.2) || bit(ing.2) || (!user_empty && user_no == SLOW);
         if careful {
             unsafe { event_careful(out, cx, c.line[lane], c.len[lane] as usize) };
             continue;
@@ -886,13 +894,25 @@ unsafe fn event_cols(out: &mut Parsed, cx: &Cx) {
             && t >= cx.window_start
             && t < cx.window_end
             && ingest * 1000 - t <= DAY_MS
-            && kind4;
+            && (kind4 || purchase);
+        // A purchase also needs a valid price; its category comes from the product.
+        let mut extra = 0u64;
+        let valid = valid && (!purchase || {
+            match parse_price(unsafe { std::slice::from_raw_parts(c.price[lane], c.price_len[lane] as usize) }) {
+                Some(cents) => {
+                    let product = unsafe { std::slice::from_raw_parts(c.prod[lane], c.prod_len[lane] as usize) };
+                    extra = (cx.products.category(product) as u64) << 24 | cents as u64;
+                    true
+                }
+                None => false,
+            }
+        });
         let ing_rel = ingest - cx.ing_base;
         if !(0..ING_LIMIT).contains(&ing_rel) {
             give_up("ingest_ts out of the stored range");
             continue;
         }
-        let a = (ing_rel as u64) << 43 | (number & SLOT_MASK) << 29;
+        let a = (ing_rel as u64) << 43 | (number & SLOT_MASK) << 29 | if valid { extra } else { 0 };
         let b = if valid {
             out.max_person = out.max_person.max(user_no >> 9);
             1u64 << 63 | ((t - cx.base) as u64) << 32 | user_no as u64

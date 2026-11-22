@@ -708,6 +708,7 @@ struct Parsed {
     nl: Vec<u32>,
     buf: Vec<u8>,
     ebatch: Batch,
+    ecol: EvCols,
     cbatch: Batch,
 }
 
@@ -764,24 +765,155 @@ fn dense_user(value: u64, ok: bool) -> u32 {
     if ok && value < (PERSON_LIMIT as u64) << 9 { value as u32 } else { SLOW }
 }
 
+/// Event lines gathered column by column, eight at a time: the raw words of the fields the
+/// vector stage decodes, and where each line is, for the few that need the careful path.
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+struct EvCols {
+    eid_w: [u64; 8],
+    eid_n: [u64; 8],
+    uid_w: [u64; 8],
+    uid_n: [u64; 8],
+    ts_w: [[u64; 8]; 4],
+    ts_n: [u64; 8],
+    ing_w: [[u64; 8]; 4],
+    ing_n: [u64; 8],
+    kind_w: [u64; 8],
+    kind_n: [u64; 8],
+    /// Field lengths: user, product.
+    user_len: [u32; 8],
+    prod_len: [u32; 8],
+    line: [*const u8; 8],
+    len: [u32; 8],
+    n: usize,
+}
+
+impl Default for EvCols {
+    fn default() -> Self {
+        // SAFETY: all-zero is a valid EvCols (null pointers are never followed while n is 0).
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+#[inline(always)]
+unsafe fn word(p: *const u8) -> u64 {
+    u64::from_le(unsafe { std::ptr::read_unaligned(p as *const u64) })
+}
+
 #[inline(always)]
 unsafe fn event_line(out: &mut Parsed, cx: &Cx, p: *const u8, len: usize) {
     if cx.dx == 9 {
         return;
     }
-    let n = out.ebatch.n;
-    if !unsafe { cut::<7>(p, len, &mut out.ebatch.f[n]) } {
+    let mut f = [(0u32, 0u32); 7];
+    if !unsafe { cut::<7>(p, len, &mut f) } {
         return;
     }
     if cx.dx == 1 {
-        std::hint::black_box(&out.ebatch.f[n]);
+        std::hint::black_box(&f);
         return;
     }
-    out.ebatch.p[n] = p;
-    out.ebatch.n = n + 1;
-    if n + 1 == 8 {
-        unsafe { event_batch(out, cx) };
+    let c = &mut out.ecol;
+    let n = c.n;
+    unsafe {
+        let at = |i: usize| p.add(f[i].0 as usize);
+        let flen = |i: usize| (f[i].1 - f[i].0) as u64;
+        // IDs: the bytes after the prefix; a wrong prefix leaves 0 characters (not decoded).
+        let (e0, el) = (at(0), flen(0));
+        c.eid_w[n] = word(e0.add(1));
+        c.eid_n[n] = if el >= 2 && *e0 == b'e' { el - 1 } else { 0 };
+        let (u0, ul) = (at(1), flen(1));
+        c.uid_w[n] = word(u0.add(1));
+        c.uid_n[n] = if ul >= 2 && *u0 == b'u' { ul - 1 } else { 0 };
+        c.user_len[n] = ul as u32;
+        let t0 = at(2);
+        let i0 = at(3);
+        for k in 0..4 {
+            c.ts_w[k][n] = word(t0.add(8 * k));
+            c.ing_w[k][n] = word(i0.add(8 * k));
+        }
+        c.ts_n[n] = flen(2);
+        c.ing_n[n] = flen(3);
+        c.kind_w[n] = word(at(4));
+        c.kind_n[n] = flen(4);
+        c.prod_len[n] = flen(5) as u32;
     }
+    c.line[n] = p;
+    c.len[n] = len as u32;
+    c.n = n + 1;
+    if n + 1 == 8 {
+        unsafe { event_cols(out, cx) };
+    }
+}
+
+const VIEW: u64 = u32::from_le_bytes(*b"view") as u64;
+const CART: u64 = u32::from_le_bytes(*b"cart") as u64;
+
+/// Decodes a column batch. Lines the fast path does not cover (purchases, IDs that are not
+/// dense numbers, timestamps of unusual shapes) go through `event_careful`.
+unsafe fn event_cols(out: &mut Parsed, cx: &Cx) {
+    let c = out.ecol;
+    out.ecol.n = 0;
+    let n = c.n;
+    let (ev_no, ev_ok) = decode8(&c.eid_w, &c.eid_n, cx.keys.event);
+    let (us_no, us_ok) = decode8(&c.uid_w, &c.uid_n, cx.keys.user);
+    let ts = ts8(&c.ts_w, &c.ts_n, n, false);
+    let ing = ts8(&c.ing_w, &c.ing_n, n, true);
+    for lane in 0..n {
+        let bit = |m: u8| m >> lane & 1 != 0;
+        let number = ev_no[lane];
+        let user_empty = c.user_len[lane] == 0;
+        let kind4 = c.kind_n[lane] == 4 && (c.kind_w[lane] as u32 as u64 == VIEW || c.kind_w[lane] as u32 as u64 == CART);
+        let user_no = if user_empty { SLOW } else { dense_user(us_no[lane], bit(us_ok)) };
+        let careful = !bit(ev_ok) || number >= cx.ecap || bit(ts.2) || bit(ing.2) || (!user_empty && user_no == SLOW) || c.kind_n[lane] == 8;
+        if careful {
+            unsafe { event_careful(out, cx, c.line[lane], c.len[lane] as usize) };
+            continue;
+        }
+        // The rules promise a valid F1 ingest_ts; a copy without one is dropped.
+        if !bit(ing.1) {
+            continue;
+        }
+        let ingest = ing.0[lane] / 1000;
+        let t = ts.0[lane];
+        let valid = !user_empty
+            && c.prod_len[lane] != 0
+            && bit(ts.1)
+            && t >= cx.window_start
+            && t < cx.window_end
+            && ingest * 1000 - t <= DAY_MS
+            && kind4;
+        let ing_rel = ingest - cx.ing_base;
+        if !(0..ING_LIMIT).contains(&ing_rel) {
+            give_up("ingest_ts out of the stored range");
+            continue;
+        }
+        let a = (ing_rel as u64) << 43 | (number & SLOT_MASK) << 29;
+        let b = if valid {
+            out.max_person = out.max_person.max(user_no >> 9);
+            1u64 << 63 | ((t - cx.base) as u64) << 32 | user_no as u64
+        } else {
+            0
+        };
+        if cx.dx == 3 {
+            std::hint::black_box((a, b));
+            continue;
+        }
+        out.events.as_mut().unwrap().push((number >> SLOT_BITS) as usize, EvRec { a, b });
+    }
+}
+
+/// One event line the careful way: cut again, everything scalar, exactly as before.
+#[cold]
+unsafe fn event_careful(out: &mut Parsed, cx: &Cx, p: *const u8, len: usize) {
+    let mut f = [(0u32, 0u32); 7];
+    if !unsafe { cut::<7>(p, len, &mut f) } {
+        return;
+    }
+    let field = |i: usize| unsafe { std::slice::from_raw_parts(p.add(f[i].0 as usize), (f[i].1 - f[i].0) as usize) };
+    let number = unsafe { base36(field(0), b'e') }.map(|y| unscramble(y, cx.keys.event)).filter(|&n| n < cx.ecap);
+    let user_no = unsafe { base36(field(1), b'u') }.map_or(SLOW, |y| dense_user(unscramble(y, cx.keys.user), true));
+    unsafe { event_rest(out, cx, p, &f, number, user_no, Pre::Odd, Pre::Odd) };
 }
 
 unsafe fn event_batch(out: &mut Parsed, cx: &Cx) {
@@ -1587,6 +1719,7 @@ pub fn run(inp: &Inputs) -> Res<bool> {
             nl: Vec::new(),
             buf: Vec::new(),
             ebatch: Batch::default(),
+            ecol: EvCols::default(),
             cbatch: Batch::default(),
         },
         |out, item| {
@@ -1620,6 +1753,9 @@ pub fn run(inp: &Inputs) -> Res<bool> {
                 Kind::Links => for_each_line(data, len, first, last, &mut nl, |s, n| unsafe { link_line(out, &cx, p.add(s), n) }),
             }
             // The batches point into this chunk's data: finish them before it goes.
+            if out.ecol.n > 0 {
+                unsafe { event_cols(out, &cx) };
+            }
             if out.ebatch.n > 0 {
                 unsafe { event_batch(out, &cx) };
             }

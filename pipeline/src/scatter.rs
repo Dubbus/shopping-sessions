@@ -36,8 +36,8 @@ impl Arena {
             let region = unsafe { std::alloc::alloc(layout) };
             assert!(!region.is_null(), "out of memory");
             #[cfg(target_os = "linux")]
-            unsafe {
-                libc::madvise(region as *mut _, size, libc::MADV_HUGEPAGE);
+            if std::env::var_os("SS_NOHUGE").is_none() {
+                unsafe { libc::madvise(region as *mut _, size, libc::MADV_HUGEPAGE) };
             }
             REGIONS.lock().unwrap().push((region as usize, size));
             self.next = region;

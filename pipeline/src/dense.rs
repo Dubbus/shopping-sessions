@@ -1552,9 +1552,16 @@ struct Sess {
 }
 
 impl Sess {
-    fn new(campaigns: usize, days: usize) -> Self {
+    fn new(campaigns: usize, days: usize, rows: usize) -> Self {
         Sess {
-            rows: output::UserRows::default(),
+            rows: output::UserRows {
+                user_id: Vec::with_capacity(rows),
+                day: Vec::with_capacity(rows),
+                sessions: Vec::with_capacity(rows),
+                events: Vec::with_capacity(rows),
+                revenue_cents: Vec::with_capacity(rows),
+                top_category: Vec::with_capacity(rows),
+            },
             campaign_days: vec![[0; 3]; campaigns * days],
             assisted: vec![0; campaigns * days],
             in_window: vec![0; campaigns],
@@ -2063,6 +2070,8 @@ pub fn run(inp: &Inputs) -> Res<bool> {
     for (rank, &c) in by_name.iter().enumerate() {
         category_rank[c] = rank as u32;
     }
+    // Rows per events-stage thread: about one per 9 events (generator data), with room to spare.
+    let row_guess = (cx.ecap as usize / 6 / threads).min(1 << 24);
     let scx = SessCx { base, first_day, days, organic: inp.organic, category_rank: &category_rank, dx: cx.dx };
 
     // People with odd-ID events: each must be finished once, with or without numbered events.
@@ -2112,7 +2121,7 @@ pub fn run(inp: &Inputs) -> Res<bool> {
     let states: Vec<EvState> = par::run(
         threads,
         eparts,
-        |_| EvState { sess: Sess::new(campaign_count, days), slots: vec![EMPTY; 2 * SLOTS], edges: Vec::new(), slow: Vec::new(), cur: Vec::new() },
+        |_| EvState { sess: Sess::new(campaign_count, days, row_guess), slots: vec![EMPTY; 2 * SLOTS], edges: Vec::new(), slow: Vec::new(), cur: Vec::new() },
         |st, part| {
             let slots = &mut st.slots;
             let mut any = false;
@@ -2255,7 +2264,7 @@ pub fn run(inp: &Inputs) -> Res<bool> {
     let groups: Vec<(Id, (Vec<u64>, Vec<u128>))> = groups.into_iter().collect();
     let groups = Mutex::new(groups.into_iter().map(Some).collect::<Vec<_>>());
     let gcount = groups.lock().unwrap().len();
-    let more = par::run(threads, count + gcount, |_| Sess::new(campaign_count, days), |s, i| {
+    let more = par::run(threads, count + gcount, |_| Sess::new(campaign_count, days, 0), |s, i| {
         if i < count {
             let (p, mut events, sorted) = stitched.lock().unwrap()[i].take().unwrap();
             finish_person(s, p, &mut events, sorted);

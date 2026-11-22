@@ -1303,8 +1303,10 @@ fn search_from(ys: &[u64], r: usize, limit: u64, threads: usize) -> Option<u64> 
 }
 
 fn find_keys(files: &[(PathBuf, Kind, u64)], est_events: u64, est_clicks: u64, threads: usize) -> Option<Keys> {
-    let events = sample_lines(files, Kind::Events, 16_000);
-    let clicks = sample_lines(files, Kind::Clicks, 8_000);
+    let (events, clicks) = std::thread::scope(|scope| {
+        let clicks = scope.spawn(|| sample_lines(files, Kind::Clicks, 8_000));
+        (sample_lines(files, Kind::Events, 16_000), clicks.join().unwrap())
+    });
     let decode = |s: &[u8], prefix: u8| -> Option<u64> {
         let mut padded = [0u8; 32];
         if s.len() > 16 {
@@ -1742,7 +1744,31 @@ fn click_keys(clicks: &[Click], click_key: u64, extra: &[u128], out: &mut Vec<u1
 
 /// Runs the numbered path. `Ok(true)`: the tables are written. `Ok(false)`: it gave up
 /// before writing anything (the reason is logged), and the ordinary pipeline must run.
-pub fn run(inp: &Inputs) -> Res<bool> {
+pub struct Prepared {
+    files: Vec<(PathBuf, Kind, u64)>,
+    keys: Keys,
+}
+
+/// The input files and the three keys; `None` if the keys cannot be found (or a file
+/// cannot be listed: the ordinary pipeline will report that).
+pub fn prepare(data_dir: &Path, threads: usize) -> Option<Prepared> {
+    let mut files: Vec<(PathBuf, Kind, u64)> = Vec::new();
+    for (kind, folder) in [(Kind::Events, "events"), (Kind::Clicks, "clicks"), (Kind::Links, "links")] {
+        for path in crate::csv_files(&data_dir.join(folder)).ok()? {
+            let len = std::fs::metadata(&path).ok()?.len();
+            files.push((path, kind, len));
+        }
+    }
+    let bytes = |k: Kind| files.iter().filter(|f| f.1 == k).map(|f| f.2).sum::<u64>();
+    // Lines are at least ~45 (events) and ~35 (clicks) bytes; the caps are generous, and
+    // a number at or above a cap only means that row takes the general path.
+    let est_events = bytes(Kind::Events) / 60;
+    let est_clicks = bytes(Kind::Clicks) / 48;
+    let keys = find_keys(&files, est_events, est_clicks, threads)?;
+    Some(Prepared { files, keys })
+}
+
+pub fn run(inp: &Inputs, prep: Option<Prepared>) -> Res<bool> {
     let started = std::time::Instant::now();
     let mut lap = std::time::Instant::now();
     let cpu_ms = || {
@@ -1773,23 +1799,12 @@ pub fn run(inp: &Inputs) -> Res<bool> {
         return Ok(false);
     }
 
-    // ---- Files and keys
-    let mut files: Vec<(PathBuf, Kind, u64)> = Vec::new();
-    for (kind, folder) in [(Kind::Events, "events"), (Kind::Clicks, "clicks"), (Kind::Links, "links")] {
-        for path in crate::csv_files(&inp.data_dir.join(folder))? {
-            let len = std::fs::metadata(&path)?.len();
-            files.push((path, kind, len));
-        }
-    }
-    let bytes = |k: Kind| files.iter().filter(|f| f.1 == k).map(|f| f.2).sum::<u64>();
-    // Lines are at least ~45 (events) and ~35 (clicks) bytes; the caps are generous, and
-    // a number at or above a cap only means that row takes the general path.
-    let est_events = bytes(Kind::Events) / 60;
-    let est_clicks = bytes(Kind::Clicks) / 48;
-    let Some(keys) = find_keys(&files, est_events, est_clicks, threads) else {
+    // ---- Files and keys (found by `prepare`, usually on a thread started at the top of main)
+    let Some(Prepared { files, keys }) = prep else {
         eprintln!("dense: no keys");
         return Ok(false);
     };
+    let bytes = |k: Kind| files.iter().filter(|f| f.1 == k).map(|f| f.2).sum::<u64>();
     let ecap = ((bytes(Kind::Events) / 45) as u64).next_multiple_of(SLOTS as u64).max(SLOTS as u64);
     let ccap = ((bytes(Kind::Clicks) / 35) as u64).next_multiple_of(SLOTS as u64).max(SLOTS as u64);
     let (eparts, cparts) = ((ecap >> SLOT_BITS) as usize, (ccap >> SLOT_BITS) as usize);

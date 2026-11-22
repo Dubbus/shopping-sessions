@@ -490,6 +490,12 @@ fn main() -> Res<()> {
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
+    let dense_on = std::env::var("SS_DENSE").map_or(true, |v| v != "0");
+    // The numbered path's keys are found while the lookup files below are read.
+    let prepare = dense_on.then(|| {
+        let dir = data_dir.clone();
+        std::thread::spawn(move || dense::prepare(&dir, threads))
+    });
 
     // ---- Inputs --------------------------------------------------------------------------
     let manifest = std::fs::read(data_dir.join("manifest.json"))?;
@@ -535,7 +541,7 @@ fn main() -> Res<()> {
 
     // The numbered path first; it gives up before writing anything when the input is not
     // numbered the way it expects, and then everything below does the job.
-    if std::env::var("SS_DENSE").map_or(true, |v| v != "0") {
+    if let Some(prepare) = prepare {
         let inputs = dense::Inputs {
             data_dir: &data_dir,
             out_dir: &out_dir,
@@ -550,7 +556,9 @@ fn main() -> Res<()> {
             channels: &channels,
             organic,
         };
-        if dense::run(&inputs)? {
+        eprintln!("inputs     {:>8.1} ms", started.elapsed().as_secs_f64() * 1e3);
+        let prep = prepare.join().expect("prepare panicked");
+        if dense::run(&inputs, prep)? {
             std::process::exit(0);
         }
         log("dense gave up");

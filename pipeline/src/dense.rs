@@ -534,6 +534,55 @@ unsafe fn cut<const N: usize>(p: *const u8, len: usize, out: &mut [(u32, u32); N
     true
 }
 
+/// `cut::<7>` for event lines, without branches on the data: the first three commas by a
+/// trailing-zeros chain on the low 64 bits (where they are on the usual line), the last three
+/// by the same on what is left, and the quoting checked on every line. Lines whose third
+/// comma is past byte 63 go to `cut`.
+#[inline(always)]
+unsafe fn cut7(p: *const u8, len: usize, out: &mut [(u32, u32); 7]) -> bool {
+    if len > 126 {
+        return unsafe { cut::<7>(p, len, out) };
+    }
+    let live = (1u128 << len) - 1;
+    let (c, q) = unsafe { masks(p) };
+    let (c, q) = (c & live, q & live);
+    if c.count_ones() != 6 {
+        return false;
+    }
+    let lo = c as u64;
+    if lo.count_ones() < 3 {
+        return unsafe { cut::<7>(p, len, out) };
+    }
+    let c0 = lo.trailing_zeros();
+    let l1 = lo & (lo - 1);
+    let c1 = l1.trailing_zeros();
+    let l2 = l1 & (l1 - 1);
+    let c2 = l2.trailing_zeros();
+    let l3 = l2 & (l2 - 1);
+    let r = (c >> 64) << 64 | l3 as u128;
+    let c3 = r.trailing_zeros();
+    let r = r & (r - 1);
+    let c4 = r.trailing_zeros();
+    let r = r & (r - 1);
+    let c5 = r.trailing_zeros();
+    // Quotes: in positions shifted up by one, each must be a field's first or last byte, a
+    // field has both or neither, and no field is a lone quote.
+    let q1 = q << 1;
+    let starts = c << 2 | 2;
+    let ends = c | 1u128 << len;
+    let (qs, qe) = (q1 & starts, q1 & ends);
+    let wrapped = pext128(qs, starts);
+    let ok = (q1 == qs | qe) & (qs & qe == 0) & (wrapped == pext128(qe, ends));
+    let pos = [c0, c1, c2, c3, c4, c5, len as u32];
+    let mut from = 0u32;
+    for i in 0..7 {
+        let w = (wrapped >> i) as u32 & 1;
+        out[i] = (from + w, pos[i] - w);
+        from = pos[i] + 1;
+    }
+    ok
+}
+
 #[cold]
 fn cut_long<const N: usize>(line: &[u8], out: &mut [(u32, u32); N]) -> bool {
     let Some(fields) = csv::split::<N>(line) else { return false };
@@ -814,7 +863,7 @@ unsafe fn event_line(out: &mut Parsed, cx: &Cx, p: *const u8, len: usize) {
         return;
     }
     let mut f = [(0u32, 0u32); 7];
-    if !unsafe { cut::<7>(p, len, &mut f) } {
+    if !unsafe { cut7(p, len, &mut f) } {
         return;
     }
     if cx.dx == 1 {
@@ -2595,6 +2644,66 @@ mod tests {
             let mut out2 = [(0u32, 0u32); 2];
             let ok = unsafe { cut::<2>(buf.as_ptr(), len, &mut out2) };
             assert_eq!(ok, csv::split::<2>(&line).is_some(), "{}", String::from_utf8_lossy(&line));
+        }
+    }
+
+    #[test]
+    fn cut7_matches_split() {
+        let mut next = rng(0x5151_2323_7777_9999);
+        for round in 0..600_000 {
+            let mut line = Vec::new();
+            if round % 3 == 0 {
+                let len = (next() % 140) as usize;
+                line = (0..len).map(|_| b"ab,,\"\"x"[(next() % 7) as usize]).collect();
+            } else {
+                for i in 0..7 {
+                    if i > 0 {
+                        line.push(b',');
+                    }
+                    let n = match i {
+                        0 | 1 => 9,
+                        2 => [13usize, 20, 25][(next() % 3) as usize],
+                        3 => 20,
+                        4 => [4usize, 8][(next() % 2) as usize],
+                        _ => (next() % 7) as usize,
+                    };
+                    let n = if next() % 30 == 0 { (next() % 60) as usize } else { n };
+                    let quoted = next() % 5 == 0;
+                    if quoted {
+                        line.push(b'"');
+                    }
+                    for _ in 0..n {
+                        line.push(b"abc123:-TZ"[(next() % 10) as usize]);
+                    }
+                    if quoted {
+                        line.push(b'"');
+                    }
+                }
+                for _ in 0..(next() % 3) {
+                    if next() % 3 == 0 && !line.is_empty() {
+                        let at = (next() % line.len() as u64) as usize;
+                        match next() % 3 {
+                            0 => line[at] = b'"',
+                            1 => line[at] = b',',
+                            _ => {
+                                line.remove(at);
+                            }
+                        }
+                    }
+                }
+            }
+            let len = line.len();
+            let mut buf = line.clone();
+            buf.resize(len + 256, if round % 2 == 0 { b'"' } else { b',' });
+            let mut out = [(0u32, 0u32); 7];
+            let ok = unsafe { cut7(buf.as_ptr(), len, &mut out) };
+            let want = csv::split::<7>(&line);
+            assert_eq!(ok, want.is_some(), "{}", String::from_utf8_lossy(&line));
+            if let Some(w) = want {
+                for (o, f) in out.iter().zip(w) {
+                    assert_eq!(&line[o.0 as usize..o.1 as usize], f, "{}", String::from_utf8_lossy(&line));
+                }
+            }
         }
     }
 

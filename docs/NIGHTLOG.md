@@ -145,3 +145,10 @@ Container on ss-bench (Cascade Lake, scorer flags, 20M): 1.33-1.35 s median. 60M
   345 -> 304 ms. cut7 without data-dependent branches: parse ~305 -> ~297, wall ~525 -> ~516.
 - `93a5aa5`: gate 33 tests, 36/36, 169/172, dev + 20M MATCH; container median 0.673 s
   (board ~0.63); sweep 800-819 20/20; 60M MATCH.
+- Kernel agent, round 2 (ss-pmu): click lines like events (cut4 one-window cut, ck_records8);
+  scatter push inlined, bound as debug assertion. Dropped: iterating set bits in event_cols
+  (fewer instructions, more cycles). Per line now (1 thread): event cut ~190 instr / 41 cycles,
+  gather/decode/validate ~190 / 62, push ~16 cycles.
+- Mine: assist and cell updates unchecked (events ~120 -> ~117 ms).
+- ss-bench 8 threads: parse 295 -> 286, wall ~513 -> ~503 ms. Gate 35 tests, 36/36, 169/172,
+  dev + 20M MATCH; container median 0.662 s (board ~0.62); sweep 820-839 20/20; 60M 1.44 s MATCH.

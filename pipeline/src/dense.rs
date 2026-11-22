@@ -708,7 +708,10 @@ struct Parsed {
     nl: Vec<u32>,
     buf: Vec<u8>,
     ebatch: Batch,
-    ecol: EvCols,
+    ecol: Box<EvCols>,
+    ecol_spare: Option<Box<EvCols>>,
+    ccol: Box<CkCols>,
+    ccol_spare: Option<Box<CkCols>>,
     cbatch: Batch,
 }
 
@@ -852,8 +855,9 @@ const CART: u64 = u32::from_le_bytes(*b"cart") as u64;
 /// Decodes a column batch. Lines the fast path does not cover (purchases, IDs that are not
 /// dense numbers, timestamps of unusual shapes) go through `event_careful`.
 unsafe fn event_cols(out: &mut Parsed, cx: &Cx) {
-    let c = out.ecol;
-    out.ecol.n = 0;
+    // Swap in the spare (empty) batch; this one is read while the next fills.
+    let mut c = out.ecol_spare.take().unwrap();
+    std::mem::swap(&mut c, &mut out.ecol);
     let n = c.n;
     let (ev_no, ev_ok) = decode8(&c.eid_w, &c.eid_n, cx.keys.event);
     let (us_no, us_ok) = decode8(&c.uid_w, &c.uid_n, cx.keys.user);
@@ -901,6 +905,8 @@ unsafe fn event_cols(out: &mut Parsed, cx: &Cx) {
         }
         out.events.as_mut().unwrap().push((number >> SLOT_BITS) as usize, EvRec { a, b });
     }
+    c.n = 0;
+    out.ecol_spare = Some(c);
 }
 
 /// One event line the careful way: cut again, everything scalar, exactly as before.
@@ -1040,19 +1046,109 @@ unsafe fn event_rest(out: &mut Parsed, cx: &Cx, p: *const u8, f: &[(u32, u32); 7
     }
 }
 
+/// Click lines gathered column by column, like `EvCols`.
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+struct CkCols {
+    kid_w: [u64; 8],
+    kid_n: [u64; 8],
+    uid_w: [u64; 8],
+    uid_n: [u64; 8],
+    ts_w: [[u64; 8]; 4],
+    ts_n: [u64; 8],
+    user_len: [u32; 8],
+    camp: [*const u8; 8],
+    camp_len: [u32; 8],
+    line: [*const u8; 8],
+    len: [u32; 8],
+    n: usize,
+}
+
+impl Default for CkCols {
+    fn default() -> Self {
+        // SAFETY: all-zero is a valid CkCols (null pointers are never followed while n is 0).
+        unsafe { std::mem::zeroed() }
+    }
+}
+
 #[inline(always)]
 unsafe fn click_line(out: &mut Parsed, cx: &Cx, p: *const u8, len: usize) {
-    let n = out.cbatch.n;
     let mut f = [(0u32, 0u32); 4];
     if !unsafe { cut::<4>(p, len, &mut f) } {
         return;
     }
-    out.cbatch.f[n][..4].copy_from_slice(&f);
-    out.cbatch.p[n] = p;
-    out.cbatch.n = n + 1;
-    if n + 1 == 8 {
-        unsafe { click_batch(out, cx) };
+    let c = &mut out.ccol;
+    let n = c.n;
+    unsafe {
+        let at = |i: usize| p.add(f[i].0 as usize);
+        let flen = |i: usize| (f[i].1 - f[i].0) as u64;
+        let (k0, kl) = (at(0), flen(0));
+        c.kid_w[n] = word(k0.add(1));
+        c.kid_n[n] = if kl >= 2 && *k0 == b'k' { kl - 1 } else { 0 };
+        let (u0, ul) = (at(1), flen(1));
+        c.uid_w[n] = word(u0.add(1));
+        c.uid_n[n] = if ul >= 2 && *u0 == b'u' { ul - 1 } else { 0 };
+        c.user_len[n] = ul as u32;
+        c.camp[n] = at(2);
+        c.camp_len[n] = flen(2) as u32;
+        let t0 = at(3);
+        for k in 0..4 {
+            c.ts_w[k][n] = word(t0.add(8 * k));
+        }
+        c.ts_n[n] = flen(3);
     }
+    c.line[n] = p;
+    c.len[n] = len as u32;
+    c.n = n + 1;
+    if n + 1 == 8 {
+        unsafe { click_cols(out, cx) };
+    }
+}
+
+unsafe fn click_cols(out: &mut Parsed, cx: &Cx) {
+    let mut c = out.ccol_spare.take().unwrap();
+    std::mem::swap(&mut c, &mut out.ccol);
+    let n = c.n;
+    let (ck_no, ck_ok) = decode8(&c.kid_w, &c.kid_n, cx.keys.click);
+    let (us_no, us_ok) = decode8(&c.uid_w, &c.uid_n, cx.keys.user);
+    let ts = ts8(&c.ts_w, &c.ts_n, n, false);
+    for lane in 0..n {
+        let bit = |m: u8| m >> lane & 1 != 0;
+        if c.user_len[lane] == 0 {
+            continue;
+        }
+        let number = ck_no[lane];
+        let user_no = dense_user(us_no[lane], bit(us_ok));
+        if !bit(ck_ok) || number >= cx.ccap || bit(ts.2) || user_no == SLOW {
+            unsafe { click_careful(out, cx, c.line[lane], c.len[lane] as usize) };
+            continue;
+        }
+        let Some(campaign) = cx.campaigns.get(unsafe { std::slice::from_raw_parts(c.camp[lane], c.camp_len[lane] as usize) }) else { continue };
+        let t = ts.0[lane];
+        if !bit(ts.1) || t < cx.base || t >= cx.window_end {
+            continue;
+        }
+        out.max_person = out.max_person.max(user_no >> 9);
+        let a = (number & SLOT_MASK) << 48 | (campaign as u64) << 32 | (t - cx.base) as u64;
+        out.clicks.as_mut().unwrap().push((number >> SLOT_BITS) as usize, CkRec { a, b: user_no as u64 });
+    }
+    c.n = 0;
+    out.ccol_spare = Some(c);
+}
+
+/// One click line the careful way: cut again, everything scalar.
+#[cold]
+unsafe fn click_careful(out: &mut Parsed, cx: &Cx, p: *const u8, len: usize) {
+    let mut f4 = [(0u32, 0u32); 4];
+    if !unsafe { cut::<4>(p, len, &mut f4) } {
+        return;
+    }
+    let mut f = [(0u32, 0u32); 7];
+    f[..4].copy_from_slice(&f4);
+    let field = |i: usize| unsafe { std::slice::from_raw_parts(p.add(f[i].0 as usize), (f[i].1 - f[i].0) as usize) };
+    let number = unsafe { base36(field(0), b'k') }.map(|y| unscramble(y, cx.keys.click)).filter(|&m| m < cx.ccap);
+    let user_no = unsafe { base36(field(1), b'u') }.map_or(SLOW, |y| dense_user(unscramble(y, cx.keys.user), true));
+    unsafe { click_rest(out, cx, p, &f, number, user_no, Pre::Odd) };
 }
 
 unsafe fn click_batch(out: &mut Parsed, cx: &Cx) {
@@ -1719,7 +1815,10 @@ pub fn run(inp: &Inputs) -> Res<bool> {
             nl: Vec::new(),
             buf: Vec::new(),
             ebatch: Batch::default(),
-            ecol: EvCols::default(),
+            ecol: Box::default(),
+            ecol_spare: Some(Box::default()),
+            ccol: Box::default(),
+            ccol_spare: Some(Box::default()),
             cbatch: Batch::default(),
         },
         |out, item| {
@@ -1755,6 +1854,9 @@ pub fn run(inp: &Inputs) -> Res<bool> {
             // The batches point into this chunk's data: finish them before it goes.
             if out.ecol.n > 0 {
                 unsafe { event_cols(out, &cx) };
+            }
+            if out.ccol.n > 0 {
+                unsafe { click_cols(out, &cx) };
             }
             if out.ebatch.n > 0 {
                 unsafe { event_batch(out, &cx) };

@@ -1541,7 +1541,8 @@ struct SessCx<'a> {
 /// Per-thread aggregation state, as in main.rs's sessions stage.
 struct Sess {
     rows: output::UserRows,
-    campaign_days: Vec<[u64; 3]>,
+    /// Per (campaign, day): sessions | purchasing sessions << 32, and revenue.
+    campaign_days: Vec<[u64; 2]>,
     assisted: Vec<u32>,
     in_window: Vec<u32>,
     slot: Vec<u32>,
@@ -1562,7 +1563,7 @@ impl Sess {
                 revenue_cents: Vec::with_capacity(rows),
                 top_category: Vec::with_capacity(rows),
             },
-            campaign_days: vec![[0; 3]; campaigns * days],
+            campaign_days: vec![[0; 2]; campaigns * days],
             assisted: vec![0; campaigns * days],
             in_window: vec![0; campaigns],
             slot: vec![0; campaigns],
@@ -1599,9 +1600,15 @@ impl Sess {
         };
         let (mut lo, mut hi) = (0, 0);
         let mut i = 0;
+        // The day of a session start, recomputed only when a start passes the current day's end.
+        let mut day = 0i64;
+        let mut day_end = 0u32;
         while i < events.len() {
             let start = (events[i] >> 32) as u32;
-            let day = (cx.base + start as i64).div_euclid(DAY_MS);
+            if start >= day_end || row_day == i64::MIN {
+                day = (cx.base + start as i64).div_euclid(DAY_MS);
+                day_end = ((day + 1) * DAY_MS - cx.base).min(u32::MAX as i64) as u32;
+            }
             if day != row_day {
                 flush(row_day, row_sessions, row_events, row_revenue, &mut self.day_categories);
                 (row_day, row_sessions, row_events, row_revenue) = (day, 0, 0, 0);
@@ -1630,28 +1637,26 @@ impl Sess {
             row_events += count;
             row_revenue += revenue as i64;
 
+            // Clicks are unique here (deduplicated by number or by ID); a copy would only
+            // count twice in `in_window`, which never changes which campaigns are active.
             while hi < clicks.len() && click_ts(clicks[hi]) <= start {
-                if hi == 0 || clicks[hi] >> 32 != clicks[hi - 1] >> 32 {
-                    let c = clicks[hi] as u32 as usize;
-                    if self.in_window[c] == 0 {
-                        self.slot[c] = self.active.len() as u32;
-                        self.active.push(c as u32);
-                    }
-                    self.in_window[c] += 1;
+                let c = clicks[hi] as u32 as usize;
+                if self.in_window[c] == 0 {
+                    self.slot[c] = self.active.len() as u32;
+                    self.active.push(c as u32);
                 }
+                self.in_window[c] += 1;
                 hi += 1;
             }
             while lo < hi && (start - click_ts(clicks[lo])) as i64 > WEEK_MS {
-                if lo == 0 || clicks[lo] >> 32 != clicks[lo - 1] >> 32 {
-                    let c = clicks[lo] as u32 as usize;
-                    self.in_window[c] -= 1;
-                    if self.in_window[c] == 0 {
-                        let at = self.slot[c] as usize;
-                        let moved = self.active.pop().unwrap();
-                        if moved as usize != c {
-                            self.active[at] = moved;
-                            self.slot[moved as usize] = at as u32;
-                        }
+                let c = clicks[lo] as u32 as usize;
+                self.in_window[c] -= 1;
+                if self.in_window[c] == 0 {
+                    let at = self.slot[c] as usize;
+                    let moved = self.active.pop().unwrap();
+                    if moved as usize != c {
+                        self.active[at] = moved;
+                        self.slot[moved as usize] = at as u32;
                     }
                 }
                 lo += 1;
@@ -1660,9 +1665,8 @@ impl Sess {
             let day_index = (day - cx.first_day) as usize;
             if cx.dx != 25 {
                 let cell = &mut self.campaign_days[credited * cx.days + day_index];
-                cell[0] += 1;
-                cell[1] += (revenue != 0) as u64;
-                cell[2] += revenue;
+                cell[0] += 1 | ((revenue != 0) as u64) << 32;
+                cell[1] += revenue;
             }
             if cx.dx != 26 {
                 for &c in &self.active {
@@ -2320,9 +2324,9 @@ fn write(inp: &Inputs, sessions: &[Sess], days: usize, first_day: i64, campaign_
             let mut total = [0u64; 4];
             for s in sessions {
                 let cell = s.campaign_days[campaign * days + day];
-                for k in 0..3 {
-                    total[k] += cell[k];
-                }
+                total[0] += cell[0] & 0xFFFF_FFFF;
+                total[1] += cell[0] >> 32;
+                total[2] += cell[1];
                 total[3] += s.assisted[campaign * days + day] as u64;
             }
             if total[0] == 0 && total[3] == 0 {

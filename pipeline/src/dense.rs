@@ -179,6 +179,129 @@ fn decode8(words: &[u64; 8], chars: &[u64; 8], key: u64) -> ([u64; 8], u8) {
     }
 }
 
+/// Days in each month minus 28 (non-leap), two bits per month at bit 2 * month.
+const DIM_BITS: u64 = {
+    let off = [0u64, 3, 0, 3, 2, 3, 2, 3, 3, 2, 3, 2, 3];
+    let mut bits = 0u64;
+    let mut m = 1;
+    while m <= 12 {
+        bits |= off[m] << (2 * m);
+        m += 1;
+    }
+    bits
+};
+
+/// Eight timestamps at once. `words[i]` holds the first 32 bytes of field `i` and `lens[i]`
+/// its length. Lanes of the usual shapes (F1: 20 bytes ending `Z`; F2: 25 bytes with a sign
+/// at 19; F3: 13 bytes) are parsed here exactly as `ts::parse` would; `ok` has the lanes
+/// that are valid. Every other lane, and year 0000, is in `odd`, for the scalar parser.
+/// `f1_only` (ingest_ts): only F1 counts, and other shapes are simply not ok.
+#[inline(always)]
+fn ts8(words: &[[u64; 8]; 4], lens: &[u64; 8], lanes: usize, f1_only: bool) -> ([i64; 8], u8, u8) {
+    let live = if lanes >= 8 { 0xFF } else { (1u8 << lanes) - 1 };
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "avx512dq"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        let c = |v: i64| _mm512_set1_epi64(v);
+        let ld = |a: &[u64; 8]| _mm512_loadu_si512(a.as_ptr() as *const _);
+        let (w0, w1, w2, w3, len) = (ld(&words[0]), ld(&words[1]), ld(&words[2]), ld(&words[3]), ld(lens));
+        macro_rules! byte {
+            ($w:expr, $k:literal) => {
+                _mm512_and_si512(_mm512_srli_epi64::<{ 8 * $k }>($w), c(0xFF))
+            };
+        }
+        let eq = |a: __m512i, b: i64| _mm512_cmpeq_epi64_mask(a, c(b));
+        let le = |a: __m512i, b: i64| _mm512_cmple_epu64_mask(a, c(b));
+        let ten = |a: __m512i, b: __m512i| _mm512_add_epi64(_mm512_mul_epu32(a, c(10)), b);
+        let zeros = c(0x3030_3030_3030_3030);
+        // Digit bytes as values; a lane is bad if any digit byte is not '0'..'9'.
+        let digits_ok = |x: __m512i, mask: u64| {
+            let m = _mm512_and_si512(x, c(mask as i64));
+            let bad = _mm512_and_si512(_mm512_or_si512(_mm512_add_epi64(m, c((0x7676_7676_7676_7676 & mask) as i64)), m), c((0x8080_8080_8080_8080 & mask) as i64));
+            _mm512_testn_epi64_mask(bad, bad)
+        };
+        let (x0, x1, x2, x3) = (_mm512_xor_si512(w0, zeros), _mm512_xor_si512(w1, zeros), _mm512_xor_si512(w2, zeros), _mm512_xor_si512(w3, zeros));
+
+        // F1 and F2: YYYY-MM-DDTHH:MM:SS then Z or +HH:MM.
+        let z = byte!(w2, 3);
+        let f1 = eq(len, 20) & eq(z, b'Z' as i64);
+        let f2 = if f1_only { 0 } else { eq(len, 25) & (eq(z, b'+' as i64) | eq(z, b'-' as i64)) };
+        let seps = eq(_mm512_and_si512(w0, c(0xFF00_00FF_0000_0000u64 as i64)), 0x2D00_002D_0000_0000)
+            & eq(_mm512_and_si512(w1, c(0x0000_FF00_00FF_0000)), 0x0000_3A00_0054_0000)
+            & eq(byte!(w2, 0), b':' as i64);
+        let dig = digits_ok(x0, 0x00FF_FF00_FFFF_FFFF) & digits_ok(x1, 0xFFFF_00FF_FF00_FFFF) & digits_ok(x2, 0x0000_0000_00FF_FF00);
+        let y = ten(ten(ten(byte!(x0, 0), byte!(x0, 1)), byte!(x0, 2)), byte!(x0, 3));
+        let mo = ten(byte!(x0, 5), byte!(x0, 6));
+        let d = ten(byte!(x1, 0), byte!(x1, 1));
+        let h = ten(byte!(x1, 3), byte!(x1, 4));
+        let mi = ten(byte!(x1, 6), byte!(x1, 7));
+        let sec = ten(byte!(x2, 1), byte!(x2, 2));
+        // Leap year and month length.
+        let q100 = _mm512_srli_epi64::<19>(_mm512_mul_epu32(y, c(5243)));
+        let r100 = _mm512_sub_epi64(y, _mm512_mul_epu32(q100, c(100)));
+        let leap = eq(_mm512_and_si512(y, c(3)), 0) & (!eq(r100, 0) | eq(_mm512_and_si512(q100, c(3)), 0));
+        let dim = _mm512_add_epi64(c(28), _mm512_and_si512(_mm512_srlv_epi64(c(DIM_BITS as i64), _mm512_slli_epi64::<1>(mo)), c(3)));
+        let dim = _mm512_mask_add_epi64(dim, eq(mo, 2) & leap, dim, c(1));
+        let range = !eq(mo, 0) & le(mo, 12) & !eq(d, 0) & _mm512_cmple_epu64_mask(d, dim) & le(h, 23) & le(mi, 59) & le(sec, 59);
+        // days_from_civil, as in ts.rs: March-based years.
+        let early = le(mo, 2);
+        let yp = _mm512_mask_sub_epi64(y, early, y, c(1));
+        let era = _mm512_srli_epi64::<22>(_mm512_mul_epu32(yp, c(10486)));
+        let yoe = _mm512_sub_epi64(yp, _mm512_mul_epu32(era, c(400)));
+        let mp = _mm512_mask_add_epi64(_mm512_sub_epi64(mo, c(3)), early, mo, c(9));
+        let doy = _mm512_add_epi64(_mm512_srli_epi64::<18>(_mm512_mul_epu32(_mm512_add_epi64(_mm512_mul_epu32(mp, c(153)), c(2)), c(52429))), _mm512_sub_epi64(d, c(1)));
+        let doe = _mm512_add_epi64(
+            _mm512_sub_epi64(_mm512_add_epi64(_mm512_mul_epu32(yoe, c(365)), _mm512_srli_epi64::<2>(yoe)), _mm512_srli_epi64::<19>(_mm512_mul_epu32(yoe, c(5243)))),
+            doy,
+        );
+        let days = _mm512_sub_epi64(_mm512_add_epi64(_mm512_mul_epu32(era, c(146_097)), doe), c(719_468));
+        let tod = _mm512_add_epi64(_mm512_add_epi64(_mm512_mul_epu32(h, c(3600)), _mm512_mul_epu32(mi, c(60))), sec);
+        let mut secs = _mm512_add_epi64(_mm512_mullo_epi64(days, c(86_400)), tod);
+        let mut ok = (f1 | f2) & seps & dig & range;
+        if !f1_only {
+            // F2: the offset, subtracted to get UTC.
+            let oh = ten(byte!(x2, 4), byte!(x2, 5));
+            let om = ten(byte!(x2, 7), byte!(x3, 0));
+            let off_ok = digits_ok(x2, 0xFF00_FFFF_0000_0000) & digits_ok(x3, 0xFF) & eq(byte!(w2, 6), b':' as i64) & le(oh, 23) & le(om, 59);
+            ok &= f1 | off_ok;
+            let off = _mm512_mul_epu32(_mm512_add_epi64(_mm512_mul_epu32(oh, c(60)), om), c(60));
+            let plus = f2 & eq(z, b'+' as i64);
+            let minus = f2 & eq(z, b'-' as i64);
+            secs = _mm512_mask_sub_epi64(secs, plus, secs, off);
+            secs = _mm512_mask_add_epi64(secs, minus, secs, off);
+        }
+        let mut ms = _mm512_mullo_epi64(secs, c(1000));
+        let year0 = (f1 | f2) & eq(y, 0);
+        let mut odd = 0u8;
+        if f1_only {
+            odd |= year0;
+        } else {
+            // F3: 13 digits.
+            let f3 = eq(len, 13);
+            let a = x0;
+            let b = _mm512_xor_si512(_mm512_or_si512(_mm512_slli_epi64::<24>(w1), c(0x30_3030)), zeros);
+            let f3_ok = digits_ok(a, u64::MAX) & digits_ok(b, u64::MAX);
+            let eight = |x: __m512i| {
+                let p = _mm512_maddubs_epi16(x, _mm512_set1_epi16(0x010A));
+                let q = _mm512_madd_epi16(p, _mm512_set1_epi32(0x0001_0064));
+                _mm512_add_epi64(_mm512_mul_epu32(q, c(10_000)), _mm512_srli_epi64::<32>(q))
+            };
+            let v3 = _mm512_add_epi64(_mm512_mul_epu32(eight(a), c(100_000)), eight(b));
+            ms = _mm512_mask_mov_epi64(ms, f3, v3);
+            ok = (ok & !f3) | (f3 & f3_ok);
+            odd = !(f1 | f2 | f3) | year0;
+        }
+        let mut out = [0i64; 8];
+        _mm512_storeu_si512(out.as_mut_ptr() as *mut _, ms);
+        (out, ok & !odd & live, odd & live)
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "avx512dq")))]
+    {
+        let _ = (words, lens, f1_only);
+        (([0i64; 8]), 0, live)
+    }
+}
+
 /// Writes `prefix` and base 36 of `value` into `out`; returns the length.
 fn write_base36(out: &mut [u8; 32], prefix: u8, mut value: u64) -> usize {
     const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
@@ -668,21 +791,56 @@ unsafe fn event_batch(out: &mut Parsed, cx: &Cx) {
     let (uw, uc) = unsafe { id_words(&b, 1, b'u') };
     let (ev_no, ev_ok) = decode8(&ew, &ec, cx.keys.event);
     let (us_no, us_ok) = decode8(&uw, &uc, cx.keys.user);
+    let (tw, tl) = unsafe { ts_words(&b, 2) };
+    let (iw, il) = unsafe { ts_words(&b, 3) };
+    let ts = ts8(&tw, &tl, b.n, false);
+    let ing = ts8(&iw, &il, b.n, true);
     for lane in 0..b.n {
         let number = if ev_ok >> lane & 1 != 0 && ev_no[lane] < cx.ecap { Some(ev_no[lane]) } else { None };
         let user_no = dense_user(us_no[lane], us_ok >> lane & 1 != 0);
-        unsafe { event_rest(out, cx, b.p[lane], &b.f[lane], number, user_no) };
+        let bit = |m: u8| m >> lane & 1 != 0;
+        let t = if bit(ts.2) { Pre::Odd } else if bit(ts.1) { Pre::Some(ts.0[lane]) } else { Pre::None };
+        let i = if bit(ing.2) { Pre::Odd } else if bit(ing.1) { Pre::Some(ing.0[lane] / 1000) } else { Pre::None };
+        unsafe { event_rest(out, cx, b.p[lane], &b.f[lane], number, user_no, t, i) };
     }
 }
 
+/// A timestamp parsed with its batch, or left for the scalar parser.
+#[derive(Clone, Copy)]
+enum Pre {
+    Some(i64),
+    None,
+    Odd,
+}
+
+/// The first 32 bytes and the length of field `i` of each line of the batch.
 #[inline(always)]
-unsafe fn event_rest(out: &mut Parsed, cx: &Cx, p: *const u8, f: &[(u32, u32); 7], number: Option<u64>, user_no: u32) {
+unsafe fn ts_words(b: &Batch, i: usize) -> ([[u64; 8]; 4], [u64; 8]) {
+    let (mut w, mut l) = ([[0u64; 8]; 4], [0u64; 8]);
+    for lane in 0..b.n {
+        let (s, e) = b.f[lane][i];
+        let at = unsafe { b.p[lane].add(s as usize) } as *const u64;
+        for k in 0..4 {
+            w[k][lane] = u64::from_le(unsafe { std::ptr::read_unaligned(at.add(k)) });
+        }
+        l[lane] = (e - s) as u64;
+    }
+    (w, l)
+}
+
+#[inline(always)]
+unsafe fn event_rest(out: &mut Parsed, cx: &Cx, p: *const u8, f: &[(u32, u32); 7], number: Option<u64>, user_no: u32, ts: Pre, ing: Pre) {
     let field = |i: usize| unsafe { std::slice::from_raw_parts(p.add(f[i].0 as usize), (f[i].1 - f[i].0) as usize) };
     let id = field(0);
     if id.is_empty() {
         return;
     }
-    let Some(ingest) = out.dates.parse_f1_secs(field(3)) else { return };
+    let ingest = match ing {
+        Pre::Some(v) => Some(v),
+        Pre::None => None,
+        Pre::Odd => out.dates.parse_f1_secs(field(3)),
+    };
+    let Some(ingest) = ingest else { return };
     if cx.dx == 2 {
         std::hint::black_box(ingest);
         return;
@@ -694,7 +852,12 @@ unsafe fn event_rest(out: &mut Parsed, cx: &Cx, p: *const u8, f: &[(u32, u32); 7
         if user.is_empty() || product.is_empty() {
             break 'valid;
         }
-        let Some(t) = out.dates.parse(field(2)) else { break 'valid };
+        let t = match ts {
+            Pre::Some(v) => Some(v),
+            Pre::None => None,
+            Pre::Odd => out.dates.parse(field(2)),
+        };
+        let Some(t) = t else { break 'valid };
         if t < cx.window_start || t >= cx.window_end || ingest * 1000 - t > DAY_MS {
             break 'valid;
         }
@@ -2014,6 +2177,62 @@ mod tests {
                 assert_eq!(ok >> lane & 1 != 0, want.is_some(), "lane {lane} n {} {:x}", n[lane], words[lane]);
                 if let Some(v) = want {
                     assert_eq!(values[lane], v);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ts8_matches_scalar() {
+        let mut next = rng(0x7777_1234_ABCD_0001);
+        let pick = |next: &mut dyn FnMut() -> u64, s: &[u8]| s[(next() % s.len() as u64) as usize];
+        for round in 0..300_000 {
+            let mut fields: Vec<Vec<u8>> = Vec::new();
+            for _ in 0..8 {
+                let y = if next() % 50 == 0 { next() % 10_000 } else { 1990 + next() % 50 };
+                let mo = if next() % 30 == 0 { next() % 100 } else { 1 + next() % 12 };
+                let d = if next() % 20 == 0 { next() % 100 } else { 1 + next() % 31 };
+                let (h, mi, se) = (next() % 26, next() % 62, next() % 62);
+                let mut t = format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{se:02}").into_bytes();
+                match next() % 6 {
+                    0 | 1 => t.push(b'Z'),
+                    2 | 3 => {
+                        let sign = if next() % 2 == 0 { b'+' } else { b'-' };
+                        t.push(sign);
+                        t.extend_from_slice(format!("{:02}:{:02}", next() % 26, next() % 62).as_bytes());
+                    }
+                    4 => t = format!("{}", 1_600_000_000_000u64 + next() % 400_000_000_000).into_bytes(),
+                    _ => t = format!("{:0w$}", next() % 10_000_000_000_000, w = (next() % 20) as usize).into_bytes(),
+                }
+                // Corruptions.
+                if next() % 6 == 0 && !t.is_empty() {
+                    let at = (next() % t.len() as u64) as usize;
+                    t[at] = pick(&mut next, b"0123456789:-+TZtz .\"x\x80");
+                }
+                if next() % 40 == 0 {
+                    t.truncate((next() % 30) as usize);
+                }
+                fields.push(t);
+            }
+            let mut words = [[0u64; 8]; 4];
+            let mut lens = [0u64; 8];
+            for (lane, f) in fields.iter().enumerate() {
+                let mut buf = f.clone();
+                buf.resize(64, if round % 2 == 0 { b'7' } else { b':' });
+                for k in 0..4 {
+                    words[k][lane] = u64::from_le_bytes(buf[8 * k..8 * k + 8].try_into().unwrap());
+                }
+                lens[lane] = f.len() as u64;
+            }
+            for f1_only in [false, true] {
+                let (ms, ok, odd) = ts8(&words, &lens, 8, f1_only);
+                for (lane, f) in fields.iter().enumerate() {
+                    if odd >> lane & 1 != 0 {
+                        continue;
+                    }
+                    let want = if f1_only { if f.len() == 20 && f[19] == b'Z' { ts::parse(f) } else { None } } else { ts::parse(f) };
+                    let got = if ok >> lane & 1 != 0 { Some(ms[lane]) } else { None };
+                    assert_eq!(got, want, "{} f1_only {f1_only}", String::from_utf8_lossy(f));
                 }
             }
         }

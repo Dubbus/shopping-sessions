@@ -1650,7 +1650,11 @@ pub fn run(inp: &Inputs) -> Res<bool> {
 
     // People with odd-ID events: each must be finished once, with or without numbered events.
     let extra_done: HashMap<u32, std::sync::atomic::AtomicBool> = extra_events.keys().map(|&p| (p, std::sync::atomic::AtomicBool::new(false))).collect();
+    let dx = cx.dx;
     let finish_person = |s: &mut Sess, p: u32, events: &mut Vec<u64>, sorted: bool| {
+        if dx == 21 {
+            return;
+        }
         let mut sorted = sorted;
         if people.flags[p as usize] & EXTRA != 0 {
             if let Some(extra) = extra_events.get(&p) {
@@ -1666,7 +1670,12 @@ pub fn run(inp: &Inputs) -> Res<bool> {
         let extra: &[u128] = if people.flags[p as usize] & EXTRA != 0 { extra_clicks.get(&p).map_or(&[], |v| v.as_slice()) } else { &[] };
         let mut keys = std::mem::take(&mut s.clicks);
         click_keys(&all_clicks[range], cx.keys.click, extra, &mut keys);
-        s.person(&scx, people.fast_name(p), events, &keys);
+        if dx == 22 {
+            s.clicks = keys;
+            return;
+        }
+        let name = if dx == 23 { 0 } else { people.fast_name(p) };
+        s.person(&scx, name, events, &keys);
         s.clicks = keys;
     };
 

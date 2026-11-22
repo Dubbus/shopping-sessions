@@ -1834,14 +1834,21 @@ impl Sess {
             }
             let credited = if hi > lo { clicks[hi - 1] as u32 as usize } else { cx.organic };
             let day_index = (day - cx.first_day) as usize;
+            assert!(day_index < cx.days && credited * cx.days + day_index < self.campaign_days.len());
             if cx.dx != 25 {
-                let cell = &mut self.campaign_days[credited * cx.days + day_index];
+                // SAFETY: checked just above.
+                let cell = unsafe { self.campaign_days.get_unchecked_mut(credited * cx.days + day_index) };
                 cell[0] += 1 | ((revenue != 0) as u64) << 32;
                 cell[1] += revenue;
             }
             if cx.dx != 26 {
-                for &c in &self.active {
-                    self.assisted[c as usize * cx.days + day_index] += 1;
+                // Every active campaign is a campaign index (below `in_window.len()`), and the
+                // assisted table has `days` cells for each.
+                debug_assert!(self.assisted.len() >= self.in_window.len() * cx.days);
+                let base = self.assisted.as_mut_ptr();
+                for &c in self.active.iter() {
+                    // SAFETY: c < in_window.len() and day_index < days, see above.
+                    unsafe { *base.add(c as usize * cx.days + day_index) += 1 };
                 }
             }
         }

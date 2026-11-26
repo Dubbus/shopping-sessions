@@ -32,3 +32,12 @@ make dev check-dev  # generate the dev set, run, compare with the published answ
 make sweep          # pipeline vs both references on 20 seeds
 make image-dev      # the same dev check through the real image and container limits
 ```
+
+## What I'd do differently
+
+The practice scores came from data made by the public generator, and I kept tuning
+against it to catch the practice leader, including a fast path built on how that
+generator assigns IDs. On the final dataset we placed below entries that were slower
+in practice. The last 10% of practice speed mattered less than holding up on data we
+hadn't seen. Next time I'd freeze the general path once it was competitive and spend
+the remaining time testing on data the generator didn't make.

@@ -1,0 +1,4 @@
+click_id,user_id,campaign_id,ts
+k1,ghost,c_1,2026-10-03T09:00:00Z
+k2,u1,c_1,2026-10-03T10:40:00Z
+k3,u4,c_2,2026-10-03T10:40:00Z

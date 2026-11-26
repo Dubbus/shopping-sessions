@@ -1,0 +1,5 @@
+user_id,day,sessions,events,revenue_cents,top_category
+u1,9999-12-03,1,2,0,
+u2,9999-12-03,1,1,0,
+u3,9999-12-14,1,1,9999,shoes
+u5,9999-12-01,1,1,0,

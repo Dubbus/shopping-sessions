@@ -1,0 +1,6 @@
+click_id,user_id,campaign_id,ts
+k1,first,c_1,2026-09-24T00:00:00Z
+k2,last,c_2,2026-10-30T23:59:59Z
+k3,every5,c_1,2026-10-01T09:00:00Z
+k4,lastms,c_1,2026-10-23T23:59:59Z
+k5,lastms,c_2,1792799999999

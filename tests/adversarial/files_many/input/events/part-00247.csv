@@ -1,0 +1,2 @@
+event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents
+e247,u25,2026-10-03T23:19:00Z,2026-10-03T23:20:00Z,purchase,p1,347

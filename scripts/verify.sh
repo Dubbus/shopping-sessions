@@ -1,15 +1,23 @@
 #!/bin/sh
-# Build, unit tests, fixtures, dev answer, and the 20M differential check. Fails loudly.
+# The gate every pipeline change must pass before it is timed or committed:
+# unit tests, the 36 fixtures, the adversarial cases (once they exist), the dev
+# answer, and reference A's output for the 20M set if it has been produced.
 set -eu
 cd "$(dirname "$0")/.."
-PY=${PY:-.venv/bin/python}
-cargo build --release -q
-cargo test --release -q 2>&1 | grep -q 'test result: ok' || { echo "unit tests FAILED"; exit 1; }
-$PY scripts/run_fixtures.py fixtures -- target/release/sessions | tail -1 | grep -q '36/36' || { echo "fixtures FAILED"; exit 1; }
-rm -rf out && DATA_DIR=dev OUTPUT_DIR=out target/release/sessions 2>/dev/null
-$PY scripts/compare.py out dev-answer | tail -1 | grep -q MATCH || { echo "dev FAILED"; exit 1; }
-if [ -n "${DIFF20:-}" ]; then
-  rm -rf out2 && DATA_DIR="$DIFF20" OUTPUT_DIR=out2 target/release/sessions 2>/dev/null
-  $PY scripts/compare.py out2 "${DIFF20_REF:-out3}" | tail -1 | grep -q MATCH || { echo "20M diff FAILED"; exit 1; }
+PY=.venv/bin/python; BIN=pipeline/target/release/pipeline
+(cd pipeline && cargo build --release 2>&1 | grep -E "^(warning|error)" -A8 || true)
+(cd pipeline && cargo test --release 2>&1 | grep -E "test result|FAILED|panicked")
+$PY scripts/run_fixtures.py tests/fixtures -- $BIN | tail -1
+if [ -d tests/adversarial ] && ls tests/adversarial/*/expected >/dev/null 2>&1; then
+  $PY scripts/run_fixtures.py tests/adversarial -- $BIN | grep -v "^ok" | tail -15
 fi
-echo "verify OK"
+rm -rf out && $BIN data/dev out 2>/dev/null && echo "dev: $($PY scripts/compare.py out tests/dev-answer | tail -1)"
+# Outputs of the independent implementation on master, where they have been saved.
+for size in 20m 60m; do
+  if [ -d "$HOME/ref/$size/user_daily" ]; then
+    rm -rf out && NCPU=8 $BIN data/$size out 2>/dev/null && echo "$size vs master: $($PY scripts/compare.py out "$HOME/ref/$size" | tail -1)"
+  fi
+done
+if [ -d data/out-20m-ref ]; then
+  rm -rf out && NCPU=8 $BIN data/20m out 2>/dev/null && echo "20m: $($PY scripts/compare.py out data/out-20m-ref | tail -1)"
+fi

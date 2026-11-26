@@ -1,0 +1,18 @@
+[package]
+name = "pipeline"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+hashbrown = "0.17.1"
+libc = "0.2.191"
+memchr = "2.8.3"
+mimalloc = { version = "0.1.52", default-features = false }
+xxhash-rust = { version = "0.8.21", features = ["xxh3"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false

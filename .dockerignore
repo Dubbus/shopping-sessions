@@ -1,11 +1,6 @@
-target
-data
-output
-scratch
-dev-answer
-spec
-tests
-*.zip
-*.csv
-*.parquet
-.git
+# The image is built from pipeline/ and the dataset generator (for the training run).
+*
+!pipeline/
+!tools/
+pipeline/target/
+tools/generator/target/

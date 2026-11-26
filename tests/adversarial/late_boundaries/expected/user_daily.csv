@@ -1,0 +1,11 @@
+user_id,day,sessions,events,revenue_cents,top_category
+before1d,2026-10-03,1,1,0,
+before1s,2026-10-03,1,1,0,
+before1y,2026-10-03,1,1,0,
+edge_end,2026-10-14,1,1,0,
+edge_start,2026-10-01,1,1,0,
+exact24h,2026-10-03,1,1,0,
+f2exact24h,2026-10-03,1,1,0,
+f3exact24h,2026-10-03,1,1,0,
+minus1ms,2026-10-03,1,1,0,
+zero,2026-10-03,1,1,0,

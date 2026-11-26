@@ -1,0 +1,9 @@
+user_id,day,sessions,events,revenue_cents,top_category
+good0,2026-10-03,1,1,1,shoes
+good1,2026-10-03,1,1,1,shoes
+good2,2026-10-03,1,1,10000000,shoes
+good3,2026-10-03,1,1,10000000,shoes
+good4,2026-10-03,1,1,250,shoes
+good5,2026-10-03,1,1,9999999,shoes
+good6,2026-10-03,1,1,500,shoes
+good7,2026-10-03,1,1,250,shoes

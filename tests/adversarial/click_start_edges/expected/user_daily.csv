@@ -1,0 +1,8 @@
+user_id,day,sessions,events,revenue_cents,top_category
+after1ms,2026-10-03,1,1,0,
+after1s,2026-10-03,1,1,0,
+at,2026-10-03,1,1,0,
+before1ms,2026-10-03,1,1,0,
+f2at,2026-10-03,1,1,0,
+msafter,2026-10-03,1,1,0,
+msat,2026-10-03,1,1,0,

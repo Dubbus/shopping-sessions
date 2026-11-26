@@ -1,0 +1,8 @@
+click_id,user_id,campaign_id,ts
+k1,at,c_1,2026-10-03T10:00:00Z
+k2,after1ms,c_1,1791021600001
+k3,before1ms,c_1,1791021599999
+k4,after1s,c_1,2026-10-03T10:00:01Z
+k5,msat,c_1,1791021600500
+k6,msafter,c_1,1791021600501
+k7,f2at,c_2,2026-10-02T21:15:00-12:45

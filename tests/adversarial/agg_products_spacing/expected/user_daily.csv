@@ -1,0 +1,14 @@
+user_id,day,sessions,events,revenue_cents,top_category
+u00,2026-10-03,1,1,100,plain
+u01,2026-10-03,1,1,101,space before
+u02,2026-10-03,1,1,102,space after
+u03,2026-10-03,1,1,103,upper
+u04,2026-10-03,1,1,104,inner
+u05,2026-10-03,1,1,105,tab
+u06,2026-10-03,1,1,106,utf8
+u07,2026-10-03,1,1,107,header-like
+u08,2026-10-03,1,1,108,long
+u09,2026-10-03,1,1,109,digits
+u10,2026-10-03,1,1,110,digit
+unk,2026-10-03,1,1,5,unknown
+unk2,2026-10-03,1,1,5,unknown

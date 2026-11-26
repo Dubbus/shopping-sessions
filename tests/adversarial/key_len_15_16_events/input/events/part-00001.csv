@@ -1,0 +1,16 @@
+event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents
+"eeeeeeeeeeeeee",other,2026-10-03T10:00:00Z,2026-10-03T11:00:01Z,purchase,p1,5000
+"eeeeeeeeeeeeeee",other,2026-10-03T10:01:00Z,2026-10-03T11:00:02Z,purchase,p1,5000
+"eeeeeeeeeeeeeeee",other,2026-10-03T10:02:00Z,2026-10-03T11:00:03Z,purchase,p1,5000
+"eeeeeeeeeeeeeeeee",other,2026-10-03T10:03:00Z,2026-10-03T11:00:04Z,purchase,p1,5000
+"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",other,2026-10-03T10:04:00Z,2026-10-03T11:00:05Z,purchase,p1,5000
+"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",other,2026-10-03T10:05:00Z,2026-10-03T11:00:06Z,purchase,p1,5000
+"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",other,2026-10-03T10:06:00Z,2026-10-03T11:00:07Z,purchase,p1,5000
+"fffffffffffffffa",other,2026-10-03T10:07:00Z,2026-10-03T11:00:08Z,purchase,p1,5000
+"fffffffffffffffb",other,2026-10-03T10:08:00Z,2026-10-03T11:00:09Z,purchase,p1,5000
+"aggggggggggggggg",other,2026-10-03T10:09:00Z,2026-10-03T11:00:10Z,purchase,p1,5000
+"bggggggggggggggg",other,2026-10-03T10:10:00Z,2026-10-03T11:00:11Z,purchase,p1,5000
+"HHHHHHHHHHHHHHHH",other,2026-10-03T10:11:00Z,2026-10-03T11:00:12Z,purchase,p1,5000
+"hhhhhhhhhhhhhhhh",other,2026-10-03T10:12:00Z,2026-10-03T11:00:13Z,purchase,p1,5000
+"éééééééé",other,2026-10-03T10:13:00Z,2026-10-03T11:00:14Z,purchase,p1,5000
+"éééééééé",other,2026-10-03T10:14:00Z,2026-10-03T11:00:15Z,purchase,p1,5000

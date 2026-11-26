@@ -1,30 +1,39 @@
-# syntax=docker/dockerfile:1
-# Build has network (10 min cap); run has none. Scored image is linux/amd64, <= 8 GB.
-# No platform pinned, so `make build PLATFORM=linux/arm64` gives a fast native image on a Mac.
-
-FROM rust:1.91-slim-bookworm AS build
-ARG TARGETARCH
+# Shopping Sessions: one static Rust binary in an otherwise empty image.
+# Builds for the machine it is built on (the scorer builds natively on linux/amd64).
+FROM rust:1-slim-bookworm AS build
 WORKDIR /src
+COPY pipeline/ pipeline/
+COPY tools/generator/ generator/
+# Fully static (glibc), so the final image needs nothing else. On x86-64 the build
+# targets Cascade Lake (AVX-512): the scorers are GCP n2 Xeons, Cascade Lake or newer.
+# Such an image does not run under emulation on an Apple-silicon Mac; test it on x86.
+#
+# The build is profile-guided: an instrumented binary runs once on a 2M-event dataset
+# made here with the organisers' generator, and the real build uses what it recorded.
+# If any part of that fails, the binary is built without a profile instead.
+RUN set -eu; \
+    case "$(uname -m)" in \
+      x86_64) cpu="-C target-cpu=cascadelake" ;; \
+      *) cpu="" ;; \
+    esac; \
+    target="$(rustc -vV | sed -n 's/^host: //p')"; \
+    flags="-C target-feature=+crt-static $cpu"; \
+    profile=""; \
+    if rustup component add llvm-tools-preview \
+       && (cd generator && cargo build --release --locked) \
+       && generator/target/release/generate --seed 20261121 --events 2000000 --clicks 500000 --output /train >/dev/null \
+       && (cd pipeline && RUSTFLAGS="$flags -Cprofile-generate=/pgo" cargo build --release --locked --target "$target" --target-dir /instrumented) \
+       && "/instrumented/$target/release/pipeline" /train /train-out \
+       && "$(find "$(rustc --print sysroot)" -name llvm-profdata | head -1)" merge -o /pgo/merged.profdata /pgo; then \
+      profile="-Cprofile-use=/pgo/merged.profdata"; \
+    else \
+      echo "profile-guided build unavailable; building without a profile" >&2; \
+    fi; \
+    cd pipeline; \
+    RUSTFLAGS="$flags $profile" cargo build --release --locked --target "$target"; \
+    cp "target/$target/release/pipeline" /pipeline
 
-# Scorers are GCP n2 (Cascade Lake or newer, AVX-512). x86-64-v3 = AVX2/BMI2, safe on all
-# of them; try CPU=x86-64-v4 for AVX-512 once there's something to measure.
-ARG CPU=x86-64-v3
-# Anything but an explicit arm64 build gets the amd64 flags (an unset TARGETARCH must
-# never fall through to target-cpu=native: the build host may not be the run host).
-RUN if [ "$TARGETARCH" = "arm64" ]; then echo "-C target-cpu=native" > /rustflags; \
-    else echo "-C target-cpu=${CPU}" > /rustflags; fi
-
-# Cache deps separately from source.
-COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && echo 'fn main(){}' > src/main.rs \
- && RUSTFLAGS="$(cat /rustflags)" cargo build --release \
- && rm -rf src target/release/deps/sessions* target/release/sessions*
-
-COPY src ./src
-RUN RUSTFLAGS="$(cat /rustflags)" cargo build --release
-
-# distroless/cc: glibc + libgcc only. Tiny image, fast container start.
-FROM gcr.io/distroless/cc-debian12:nonroot
-COPY --from=build /src/target/release/sessions /sessions
-USER 1000:1000
-ENTRYPOINT ["/sessions"]
+FROM scratch
+COPY --from=build /pipeline /pipeline
+# Runs with no arguments; reads $DATA_DIR, writes $OUTPUT_DIR; exit 0 means done.
+CMD ["/pipeline"]

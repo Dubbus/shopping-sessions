@@ -1,0 +1,3 @@
+user_id,day,sessions,events,revenue_cents,top_category
+first_user,2026-10-03,1,2,111,shoes
+late_user,2026-10-05,1,1,0,
